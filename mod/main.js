@@ -1,10 +1,11 @@
-// Workbench: a client's tickets in Herdr. A dialog with its boards (keys.json: "cmd-shift-b":
-// "mod.open:workbench") and a sidebar for a layout's column (props.view "sidebar").
+// Workbench: a client's tickets and merge requests in Herdr. A dialog with its boards and its merge
+// requests (keys.json: "cmd-shift-b": "mod.open:workbench") and a sidebar for a layout's column
+// (props.view "sidebar").
 // - Clients: one profile per client (profiles.js), chosen by the folder of the terminal you were in. It
-//   says which tracker, which boards, and which Keychain item holds the token.
-// - Trackers: a provider reads one and gives its tickets in one shape (providers/jira.js). Everything is
-//   read; the only writes are a status move or a comment, from the panel under the board, each after a
-//   confirmation.
+//   says which tracker and code host, which boards, and which Keychain items hold the tokens.
+// - Providers read a tracker (providers/jira.js) or a code host (providers/gitlab.js) and give tickets
+//   and changes in one shape. Everything is read; the only writes are a status move or a comment, from
+//   the panel under the board, each after a confirmation.
 // - Start: the agent button runs `roger open <key>` in the folder of the terminal you were in, like the
 //   roger dialog (mods/roger); when roger asks which project or branch, its options become buttons.
 import { View, div, image, svg } from "gpui-kit";
@@ -13,6 +14,7 @@ import { props, openOverlay, closeOverlay, theme, focused, spaces, exec, home, n
 import { failure } from "./http.js";
 import { PROFILES, loadProfiles, clientFor } from "./profiles.js";
 import { jiraTracker } from "./providers/jira.js";
+import { gitlabHost } from "./providers/gitlab.js";
 
 const REFRESH_MS = 60_000;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -27,9 +29,30 @@ const PRIORITY_MARKS = {
   lowest: { glyph: "↓↓", color: "#4bade8" },
 };
 
+// A pipeline's color, by its status
+const PIPELINE_COLORS = {
+  success: "#22a06b", failed: "#e5493a", running: "#579dff", pending: "#e2b203", created: "#e2b203",
+  preparing: "#e2b203", waiting_for_resource: "#e2b203", scheduled: "#e2b203",
+};
+
 // The tracker a client's profile names, or null for a kind this mod can't read
 function trackerOf(client) {
   return client?.tracker?.kind === "jira" ? jiraTracker(client.tracker) : null;
+}
+
+// The code host a client's profile names, or null: none, or a kind this mod can't read
+function codeOf(client) {
+  return client?.code?.kind === "gitlab" ? gitlabHost(client.code) : null;
+}
+
+// What a merge request needs at a glance: its pipeline, approvals, open threads, conflicts
+function changeFacts(c) {
+  return [
+    c.pipeline ? `pipeline ${c.pipeline}` : "no pipeline",
+    c.approved ? `approved${c.approvedBy.length ? ` by ${c.approvedBy.join(", ")}` : ""}` : "not approved",
+    c.threads.open ? `${c.threads.open} open thread${c.threads.open === 1 ? "" : "s"}` : null,
+    c.conflicts ? "conflicts" : null,
+  ].filter(Boolean);
 }
 
 // For matching names as typed: "jurg" finds "Jürgen"
@@ -65,6 +88,9 @@ export default class Workbench extends View {
     this.collapsed = new Set();   // "<board id>/<lane id>", saved per client
     this.me = null;          // your id in the tracker, for "Only mine"
     this.boards = {};        // board id -> { columns, lanes, tickets, total, at, error }
+    this.code = null;        // the client's code host's provider, if it has one: its tab follows the boards
+    this.changes = { mine: null, review: null, at: null, error: "" };
+    this.loadingChanges = false;
     this.loading = new Set();
     this.busy = "";          // the roger command running, next to the spinner
     this.busyKey = "";
@@ -93,6 +119,7 @@ export default class Workbench extends View {
         const wanted = props()?.client;
         this.client = profiles.find((p) => wanted && p.name === wanted && !p.error && p.tracker) ?? clientFor(profiles, this.cwd);
         this.tracker = trackerOf(this.client);
+        this.code = codeOf(this.client);
         if (!this.client) this.problem = profiles.find((p) => p.error)?.error ?? `No client profile yet: write one as ${PROFILES}`;
         else if (!this.tracker) this.problem = `${this.client.name}: "${this.client.tracker.kind}" trackers aren't supported yet`;
       } catch (error) {
@@ -100,7 +127,7 @@ export default class Workbench extends View {
       }
       if (this.problem) { this.client = null; this.tracker = null; }
       if (this.client) {
-        this.board = Math.min(Math.max(load(this.saved("board"), 0), 0), this.tracker.boards.length - 1);
+        this.board = Math.min(Math.max(load(this.saved("board"), 0), 0), this.tracker.boards.length - (this.code ? 0 : 1));
         this.collapsed = new Set(load(this.saved("collapsed"), []));
         this.refresh(cx);
       }
@@ -117,7 +144,13 @@ export default class Workbench extends View {
 
   dismiss() { closeOverlay(props().overlay); }
 
+  // The tab after the boards: the code host's merge requests
+  onChanges() {
+    return Boolean(this.code) && this.board === this.tracker.boards.length;
+  }
+
   refresh(cx) {
+    if (this.onChanges()) return this.loadChanges(cx);
     const tracker = this.tracker;
     const board = tracker.boards[this.board];
     if (this.loading.has(board.id)) return;
@@ -142,9 +175,39 @@ export default class Workbench extends View {
     save(this.saved("board"), index);
     this.selected = null;
     this.pending = null;
-    const entry = this.boards[this.tracker.boards[index].id];
+    const entry = this.onChanges() ? this.changes : this.boards[this.tracker.boards[index].id];
     if (!entry?.at || Date.now() - entry.at.getTime() > REFRESH_MS) this.refresh(cx);
     cx.notify();
+  }
+
+  loadChanges(cx) {
+    if (this.loadingChanges) return;
+    this.loadingChanges = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try { Object.assign(this.changes, await this.code.changes(), { at: new Date(), error: "" }); }
+      catch (error) { this.changes.error = String(error?.message ?? error); }
+      this.loadingChanges = false;
+      if (!this.closed) cx.notify();
+    });
+  }
+
+  // A merge request as a card: pipeline, reference, project, draft; title; branches; approvals, open
+  // threads, conflicts; reviewers (yours) or author (to review). A click opens it on the code host
+  changeCard(t, c, id, yours) {
+    const facts = changeFacts(c);
+    const who = yours ? (c.reviewers.length ? `Review: ${c.reviewers.join(", ")}` : "No reviewer") : `By ${c.author}`;
+    return v_flex().id(`change-${id}`).w(300).flex_none().p(10).gap(6).rounded(8).border_1().border_color(t.border).bg(t.background)
+      .cursor_pointer().hover((s) => s.border_color(t.input)).tooltip(`Open in ${this.code.name}`).on_click(() => this.browse(c))
+      .child(h_flex().items_center().gap(6)
+        .child(div().size(8).flex_none().rounded_full().bg(PIPELINE_COLORS[c.pipeline] ?? t.dim))
+        .child(div().flex_none().text_size(11.5).font_medium().text_color(t.muted).child(c.ref))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(c.project.name))
+        .when(c.draft, (el) => el.child(div().flex_none().px(5).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted).child("Draft"))))
+      .child(div().text_size(13).whitespace_normal().child(c.title))
+      .child(div().truncate().text_size(11.5).text_color(t.dim).child(`${c.branch} → ${c.target}`))
+      .child(div().text_size(11.5).text_color(c.conflicts || c.pipeline === "failed" ? t.blocked : t.muted).child(facts.join(" · ")))
+      .child(div().truncate().text_size(11.5).text_color(t.dim).child(who));
   }
 
   // A click on a card opens its actions under the board; again, closes them
@@ -287,7 +350,9 @@ export default class Workbench extends View {
     this.closed = false;
     this.profiles = null;
     this.trackers = new Map();   // client name -> its tracker's provider
+    this.hosts = new Map();      // client name -> its code host's provider, or null
     this.side = { key: undefined, ticketClient: undefined, ticket: null, mine: {}, errors: {}, at: null, error: "",
+      changes: {}, codeErrors: {},   // client name -> { mine, review }, or why not
       folded: new Set(load("folded", [])) };   // client names whose section is closed
     cx.spawn(async (cx) => {
       try { this.profiles = await loadProfiles(); } catch (error) { this.side.error = String(error?.message ?? error); }
@@ -307,6 +372,11 @@ export default class Workbench extends View {
     return this.trackers.get(client.name);
   }
 
+  hostFor(client) {
+    if (!this.hosts.has(client.name)) this.hosts.set(client.name, codeOf(client));
+    return this.hosts.get(client.name);
+  }
+
   // The clients whose tracker this mod can read
   sideClients() {
     return (this.profiles ?? []).filter((p) => !p.error && p.tracker && this.trackerFor(p));
@@ -318,7 +388,27 @@ export default class Workbench extends View {
   }
 
   loadAllMine(cx) {
-    for (const client of this.sideClients()) this.loadMine(cx, client);
+    for (const client of this.sideClients()) {
+      this.loadMine(cx, client);
+      if (this.hostFor(client)) this.loadSideChanges(cx, client);
+    }
+  }
+
+  loadSideChanges(cx, client) {
+    cx.spawn(async (cx) => {
+      try {
+        this.side.changes[client.name] = await this.hostFor(client).changes();
+        delete this.side.codeErrors[client.name];
+      } catch (error) {
+        this.side.codeErrors[client.name] = String(error?.message ?? error);
+      }
+      if (!this.closed) cx.notify();
+    });
+  }
+
+  // The space on a merge request's branch
+  spaceOfBranch(branch) {
+    return branch ? spaces().find((s) => s.branch === branch) : null;
   }
 
   loadMine(cx, client) {
@@ -382,6 +472,32 @@ export default class Workbench extends View {
         .child(div().flex_none().text_size(11.5).font_medium().text_color(t.muted).child(k))
         .child(div().flex_1().min_w(0).truncate().text_size(12).child(ticket.title ?? ""));
     };
+    const changeRow = (change, id, host) => {
+      const s = this.spaceOfBranch(change.branch);
+      return h_flex().id(`change-${id}`).flex_none().items_center().gap(7).px(8).py(5).rounded(6).cursor_pointer()
+        .hover((st) => st.bg(t.hover)).tooltip(s ? "Go to its space" : `Open in ${host.name}`)
+        .on_click(() => { if (s) run("space.select", { id: s.id }); else this.browse(change); })
+        .child(div().size(8).flex_none().rounded_full().bg(PIPELINE_COLORS[change.pipeline] ?? t.dim))
+        .child(div().flex_none().text_size(11.5).font_medium().text_color(t.muted).child(change.ref))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(change.draft ? t.muted : t.foreground).child(change.title))
+        .when(change.threads.open > 0 || change.conflicts, (el) => el.child(div().flex_none().text_size(11).text_color(t.blocked)
+          .child(change.conflicts ? "!" : `${change.threads.open}💬`)));
+    };
+    const small = (text) => div().px(8).pt(4).text_size(10.5).font_semibold().text_color(t.dim).child(text);
+    // A client's merge requests, under its tickets: yours, then the ones waiting for your review
+    const changesOf = (c, ci) => {
+      const host = this.hostFor(c);
+      const found = this.side.changes[c.name];
+      const error = this.side.codeErrors[c.name];
+      return v_flex().id(`client-changes-${ci}`).flex_none().gap(1)
+        .when(!found && !error, (el) => el.child(small("MERGE REQUESTS")).child(div().px(8).text_color(t.working).frames(SPINNER, 90)))
+        .when(Boolean(error), (el) => el.child(small("MERGE REQUESTS")).child(div().px(8).text_size(11.5).text_color(t.blocked).child(`${host.name}: ${error}`)))
+        .when(Boolean(found), (el) => el
+          .child(small(`YOUR ${host.changeName.toUpperCase()}S · ${found.mine.length}`))
+          .children(found.mine.map((change, i) => changeRow(change, `${ci}-m${i}`, host)))
+          .child(small(`TO REVIEW · ${found.review.length}`))
+          .children(found.review.map((change, i) => changeRow(change, `${ci}-r${i}`, host))));
+    };
     // A client: its name, how many tickets are open, its boards; folded, only that
     const section = (c, ci) => {
       const folded = this.side.folded.has(c.name);
@@ -400,7 +516,8 @@ export default class Workbench extends View {
           .when(mine == null && !error, (el) => el.child(div().px(8).text_color(t.working).frames(SPINNER, 90)))
           .when(Boolean(error), (el) => el.child(div().px(8).text_size(11.5).text_color(t.blocked).child(error)))
           .when(Array.isArray(mine) && !mine.length, (el) => el.child(div().px(8).text_size(12).text_color(t.dim).child("Nothing open")))
-          .children((mine ?? []).map((ticket, i) => row(ticket, `${ci}-${i}`, this.trackerFor(c)))));
+          .children((mine ?? []).map((ticket, i) => row(ticket, `${ci}-${i}`, this.trackerFor(c))))
+          .when(Boolean(this.hostFor(c)), (el) => el.child(changesOf(c, ci))));
     };
     const clients = this.sideClients();
     const tk = this.side.ticket;
@@ -418,12 +535,25 @@ export default class Workbench extends View {
           .child(div().flex_none().px(6).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted).child(tk.status.name)))
         .child(div().text_size(13).whitespace_normal().child(tk.title))
         .child(div().text_size(11.5).text_color(t.dim).child(tk.assignee?.name ?? "Unassigned"));
+    // The merge request of the focused space's branch, from the lists already loaded
+    const branch = space?.branch;
+    const hc = branch ? Object.values(this.side.changes).flatMap((f) => [...f.mine, ...f.review]).find((c) => c.branch === branch) : null;
+    const hereChange = hc && v_flex().id("here-change").flex_none().p(10).gap(4).rounded(8).border_1().border_color(t.border).bg(t.background)
+      .cursor_pointer().hover((s) => s.border_color(t.input)).tooltip("Open the merge request").on_click(() => this.browse(hc))
+      .child(h_flex().items_center().gap(6)
+        .child(div().size(8).flex_none().rounded_full().bg(PIPELINE_COLORS[hc.pipeline] ?? t.dim))
+        .child(div().flex_none().text_size(12).font_medium().text_color(t.accent).child(hc.ref))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(hc.project.name))
+        .when(hc.draft, (el) => el.child(div().flex_none().px(5).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted).child("Draft"))))
+      .child(div().text_size(11.5).whitespace_normal().text_color(hc.conflicts || hc.pipeline === "failed" ? t.blocked : t.muted)
+        .child(changeFacts(hc).join(" · ")));
     const label = (text) => div().px(8).text_size(11).font_semibold().text_color(t.muted).child(text);
     return v_flex().id("workbench-side").size_full().bg(t.chrome)
       .min_h(0).p(10).gap(10).text_color(t.foreground)
       .child(div().flex_none().px(4).text_size(13).font_semibold().child("Workbench"))
       .child(label("THIS SPACE"))
       .child(here)
+      .when(Boolean(hc), (el) => el.child(hereChange))
       .child(v_flex().id("clients").flex_1().min_h(0).gap(10).overflow_y_scrollbar()
         .when(this.profiles != null && !clients.length, (el) => el.child(div().px(8).text_size(12).text_color(t.dim)
           .child(`No client profile with a tracker this mod reads: write one as ${PROFILES}`)))
@@ -564,9 +694,11 @@ export default class Workbench extends View {
     if (this.view) return this.renderSide(cx);
     const t = theme();
     const boards = this.tracker?.boards ?? [];
+    const onChanges = this.onChanges();
     const board = boards[this.board];
     const entry = board && this.boards[board.id];
-    const loading = Boolean(board && this.loading.has(board.id));
+    const loading = onChanges ? this.loadingChanges : Boolean(board && this.loading.has(board.id));
+    const changes = this.changes;
     const isMine = (x) => !this.mine || x.assignee?.id === this.me;
     const tickets = (entry?.tickets ?? []).filter(isMine);
     const columns = entry?.columns ?? [];
@@ -588,16 +720,27 @@ export default class Workbench extends View {
         .when(this.mine, (el) => el.justify_end())
         .child(div().size(12).rounded_full().bg(t.background)))
       .child(div().text_size(12).text_color(this.mine ? t.foreground : t.muted).child("Only mine"));
-    const status = entry?.at
+    const status = onChanges
+      ? (changes.at ? `${(changes.mine?.length ?? 0) + (changes.review?.length ?? 0)} open · updated ${changes.at.toTimeString().slice(0, 5)}` : "Loading…")
+      : entry?.at
       ? `${tickets.length} ${this.mine ? "yours" : "tickets"}` + (entry.total > (entry.tickets?.length ?? 0) ? ` (first ${entry.tickets.length} of ${entry.total})` : "")
         + ` · updated ${entry.at.toTimeString().slice(0, 5)}`
       : loading || (!this.client && !this.problem) ? "Loading…" : "";
+    // The merge requests tab: yours, then the ones waiting for your review
+    const group = (title, list, yours) => v_flex().flex_none().gap(8)
+      .child(h_flex().items_center().gap(8).px(2)
+        .child(div().text_size(13).font_semibold().child(title))
+        .when(Array.isArray(list), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(`(${list.length})`))))
+      .when(Array.isArray(list) && !list.length, (el) => el.child(div().px(2).text_size(12).text_color(t.dim).child("None")))
+      .child(h_flex().flex_wrap().items_start().gap(10)
+        .children((list ?? []).map((c, i) => this.changeCard(t, c, `${yours ? "mine" : "review"}-${i}`, yours))));
     return v_flex().id("workbench").size_full().min_h(0).p(16).gap(12).bg(t.popover).text_color(t.foreground)
       .child(h_flex().items_center().gap(8)
         .child(div().flex_none().pr(6).text_size(15).font_semibold().child(this.client?.name ?? "Workbench"))
         .children(boards.map(tab))
+        .when(Boolean(this.code), (el) => el.child(tab({ id: "changes", label: `${this.code.changeName}s` }, boards.length)))
         .child(div().flex_1())
-        .child(toggle)
+        .when(!onChanges, (el) => el.child(toggle))
         .child(h_flex().id("refresh").size(28).flex_none().items_center().justify_center().rounded(7).cursor_pointer()
           .hover((s) => s.bg(t.hover)).tooltip("Refresh").on_click((_e, cx) => { if (this.client) this.refresh(cx); })
           .child(loading ? div().text_color(t.working).frames(SPINNER, 90) : div().text_size(15).text_color(t.muted).child("↻")))
@@ -610,10 +753,14 @@ export default class Workbench extends View {
         .child(div().min_w(0).truncate().child(`${this.busy}…`))))
       .when(Boolean(this.problem), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.problem)))
       .when(Boolean(this.error), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.error)))
-      .when(Boolean(entry?.error), (el) => el.child(div().text_size(12).text_color(t.blocked).child(`${this.tracker.name}: ${entry.error}`)))
-      .child(v_flex().id("lanes").flex_1().min_h(0).gap(16).overflow_y_scrollbar()
-        .children(entry?.columns ? shown.map((l) => this.lane(t, board, columns, l)) : []))
-      .when(Boolean(sel), (el) => el.child(this.panel(t, sel, button)))
+      .when(!onChanges && Boolean(entry?.error), (el) => el.child(div().text_size(12).text_color(t.blocked).child(`${this.tracker.name}: ${entry.error}`)))
+      .when(onChanges && Boolean(changes.error), (el) => el.child(div().text_size(12).text_color(t.blocked).child(`${this.code.name}: ${changes.error}`)))
+      .when(!onChanges, (el) => el.child(v_flex().id("lanes").flex_1().min_h(0).gap(16).overflow_y_scrollbar()
+        .children(entry?.columns ? shown.map((l) => this.lane(t, board, columns, l)) : [])))
+      .when(onChanges, (el) => el.child(v_flex().id("changes").flex_1().min_h(0).gap(20).overflow_y_scrollbar()
+        .child(group("Yours", changes.mine, true))
+        .child(group("To review", changes.review, false))))
+      .when(!onChanges && Boolean(sel), (el) => el.child(this.panel(t, sel, button)))
       .child(h_flex().gap(8).text_size(11).text_color(t.dim)
         .child(div().flex_1().min_w(0).truncate().child(status))
         .child(div().flex_none().child(`Agents start in ${this.cwd.replace(home(), "~")}`)));

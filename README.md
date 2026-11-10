@@ -36,12 +36,20 @@ folder holds the terminal you were in; anywhere else, the first one.
     "hiddenColumns": ["Backlog"],
     "hiddenProjects": ["OPS"],
     "priorityAliases": { "Fire": "highest" }
+  },
+  "code": {
+    "kind": "gitlab",
+    "site": "https://gitlab.acme.example",
+    "keychain": "acme-gitlab",
+    "vpn": true
   }
 }
 ```
 
 - `folders` (optional): where the client's code lives, if not next to the profile.
 - `hiddenColumns`, `hiddenProjects`, `priorityAliases` are optional.
+- `code` (optional): the code host, for your merge requests and the ones waiting for your review. `vpn`
+  turns a 403 or no answer into "is the VPN on?". The GitLab token needs `read_api`.
 
 The token never goes in the profile. Copy it, then store it in the Keychain under the profile's
 `keychain` name:
