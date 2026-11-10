@@ -4,8 +4,8 @@
 // - Clients: one profile per client (profiles.js), chosen by the folder of the terminal you were in. It
 //   says which tracker and code host, which boards, and which Keychain items hold the tokens.
 // - Providers read a tracker (providers/jira.js) or a code host (providers/gitlab.js) and give tickets
-//   and changes in one shape. Everything is read; the only writes are a status move or a comment, from
-//   the panel under the board, each after a confirmation.
+//   and changes in one shape. Everything is read; the only writes are a ticket's status move, a merge
+//   request's pipeline retry, or a comment, from the panel under the board, each after a confirmation.
 // - Start: the agent button runs `roger open <key>` in the folder of the terminal you were in, like the
 //   roger dialog (mods/roger); when roger asks which project or branch, its options become buttons.
 import { View, div, image, svg } from "gpui-kit";
@@ -97,11 +97,13 @@ export default class Workbench extends View {
     this.error = "";
     this.choices = null;     // { label, options: [{ text, args }] } when roger asks which project or branch
     this.selected = null;    // the clicked card, whose actions show under the board
+    this.selectedChange = null;   // the same on the merge requests tab
     this.moves = null;       // its moves once loaded: [{ id, name, hint, to }], or { error }
-    this.pending = null;     // the action waiting for its confirmation: { move } or { text, content }
+    this.pending = null;     // the action waiting for its confirmation: { move }, { retry } or { text, content }
     this.acting = false;
     this.actionError = "";
     this.people = null;      // who can be mentioned: [{ id, name }], loaded at the first "@"
+    this.peopleOf = null;    // whose: "tracker", or a merge request's project
     this.mention = null;     // the name typed after a "@" at the end of the comment, or null
     this.comment = TextareaState.new({ placeholder: "Write a comment… @name mentions", rows: 2 });
     this.comment.set_auto_grow(2, 6);
@@ -174,6 +176,7 @@ export default class Workbench extends View {
     this.board = index;
     save(this.saved("board"), index);
     this.selected = null;
+    this.selectedChange = null;
     this.pending = null;
     const entry = this.onChanges() ? this.changes : this.boards[this.tracker.boards[index].id];
     if (!entry?.at || Date.now() - entry.at.getTime() > REFRESH_MS) this.refresh(cx);
@@ -193,21 +196,33 @@ export default class Workbench extends View {
   }
 
   // A merge request as a card: pipeline, reference, project, draft; title; branches; approvals, open
-  // threads, conflicts; reviewers (yours) or author (to review). A click opens it on the code host
+  // threads, conflicts; reviewers (yours) or author (to review). A click opens its actions; the
+  // reference opens it on the code host
   changeCard(t, c, id, yours) {
     const facts = changeFacts(c);
     const who = yours ? (c.reviewers.length ? `Review: ${c.reviewers.join(", ")}` : "No reviewer") : `By ${c.author}`;
-    return v_flex().id(`change-${id}`).w(300).flex_none().p(10).gap(6).rounded(8).border_1().border_color(t.border).bg(t.background)
-      .cursor_pointer().hover((s) => s.border_color(t.input)).tooltip(`Open in ${this.code.name}`).on_click(() => this.browse(c))
+    return v_flex().id(`change-${id}`).w(300).flex_none().p(10).gap(6).rounded(8).border_1()
+      .border_color(this.selectedChange?.id === c.id ? t.accent : t.border).bg(t.background)
+      .cursor_pointer().hover((s) => s.border_color(t.input)).on_click((_e, cx) => this.pickChange(cx, c))
       .child(h_flex().items_center().gap(6)
         .child(div().size(8).flex_none().rounded_full().bg(PIPELINE_COLORS[c.pipeline] ?? t.dim))
-        .child(div().flex_none().text_size(11.5).font_medium().text_color(t.muted).child(c.ref))
+        .child(div().id(`change-ref-${id}`).flex_none().text_size(11.5).font_medium().text_color(t.muted).cursor_pointer()
+          .hover((s) => s.text_color(t.accent)).tooltip(`Open in ${this.code.name}`)
+          .on_click((_e, cx) => { cx.stop_propagation(); this.browse(c); }).child(c.ref))
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(c.project.name))
         .when(c.draft, (el) => el.child(div().flex_none().px(5).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted).child("Draft"))))
       .child(div().text_size(13).whitespace_normal().child(c.title))
       .child(div().truncate().text_size(11.5).text_color(t.dim).child(`${c.branch} → ${c.target}`))
       .child(div().text_size(11.5).text_color(c.conflicts || c.pipeline === "failed" ? t.blocked : t.muted).child(facts.join(" · ")))
       .child(div().truncate().text_size(11.5).text_color(t.dim).child(who));
+  }
+
+  // A click on a merge request opens its actions under the list; again, closes them
+  pickChange(cx, c) {
+    this.selectedChange = this.selectedChange?.id === c.id ? null : c;
+    this.pending = null;
+    this.actionError = "";
+    cx.notify();
   }
 
   // A click on a card opens its actions under the board; again, closes them
@@ -233,18 +248,25 @@ export default class Workbench extends View {
     });
   }
 
-  // The people who can work on the loaded boards' tickets, once: they're the ones a comment mentions
+  // Who a comment can mention, once each: on the boards, the people who can work on their tickets; on a
+  // merge request, its project's members
   loadPeople(cx) {
+    const change = this.onChanges() ? this.selectedChange : null;
+    const of = change ? `code:${change.project.path}` : "tracker";
+    if (this.peopleOf !== of) Object.assign(this, { peopleOf: of, people: null, loadingPeople: false });
     if (this.people || this.loadingPeople) return;
     this.loadingPeople = true;
     const tickets = Object.values(this.boards).flatMap((b) => b.tickets ?? []);
     cx.spawn(async (cx) => {
+      let people;
       try {
-        this.people = await this.tracker.people(tickets);
+        people = change ? await this.code.people(change) : await this.tracker.people(tickets);
       } catch (error) {
-        this.people = [];
+        people = [];
         this.actionError = `People: ${error?.message ?? error}`;
       }
+      if (this.peopleOf !== of) return;   // another list was asked for meanwhile
+      this.people = people;
       this.loadingPeople = false;
       if (!this.closed) cx.notify();
     });
@@ -262,8 +284,41 @@ export default class Workbench extends View {
     cx.notify();
   }
 
+  // The confirmed action on a merge request: a pipeline retry, or the comment as it was when Comment was clicked
+  confirmChange(cx) {
+    const c = this.selectedChange;
+    const action = this.pending;
+    const code = this.code;
+    if (!c || !action || !code || this.acting) return;
+    this.acting = true;
+    this.actionError = "";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        if (action.retry) {
+          await code.retry(c);
+          notify({ title: `${c.ref}: pipeline retried`, body: c.title, level: "success" });
+        } else {
+          await code.comment(c, action.content);
+          notify({ title: `${c.ref}: comment posted`, body: action.text.slice(0, 120), level: "success" });
+          if (!this.closed) this.comment.set_value("");
+        }
+        this.pending = null;
+      } catch (error) {
+        const why = String(error?.message ?? error);
+        if (this.closed) notify({ title: `${c.ref}: not saved`, body: why, level: "error" });
+        this.actionError = why;
+      }
+      this.acting = false;
+      if (this.closed) return;
+      if (!this.pending) this.loadChanges(cx);
+      cx.notify();
+    });
+  }
+
   // The confirmed action: a status move, or the comment as it was when Comment was clicked
   confirm(cx) {
+    if (this.onChanges()) return this.confirmChange(cx);
     const ticket = this.selected;
     const action = this.pending;
     const tracker = this.tracker;
@@ -294,15 +349,79 @@ export default class Workbench extends View {
     });
   }
 
+  // The names matching the "@name" being typed, as buttons that make it a mention chip
+  mentionRow(t, button) {
+    const q = this.mention;
+    const people = !Array.isArray(this.people) ? [] : this.people.filter((u) => fold(u.name).includes(fold(q))).slice(0, 6);
+    return h_flex().flex_wrap().items_center().gap(6)
+      .child(div().pr(4).text_size(12).text_color(t.muted).child("Mention"))
+      .when(this.people == null, (el) => el.child(div().text_color(t.working).frames(SPINNER, 90)))
+      .when(Array.isArray(this.people) && !people.length, (el) => el.child(div().text_size(12).text_color(t.dim).child(`No one called “${q}”`)))
+      .children(people.map((u) => button(`mention-${u.id}`, u.name, (_e, cx) => this.mentionPerson(cx, u))));
+  }
+
+  // The comment field and its button, which asks for a confirmation before posting
+  commentRow(t, button) {
+    const text = this.comment.value().trim();
+    return h_flex().items_end().gap(8)
+      .child(div().flex_1().min_w(0).child(Textarea.new(this.comment).w_full().px(10).py(6).rounded(8).border_1()
+        .border_color(t.input).bg(t.background).text_size(12.5).text_color(t.foreground)))
+      .child(button("actions-comment", "Comment", (_e, cx) => {
+        if (!text) return;
+        this.pending = { text, content: this.comment.content() };
+        this.actionError = "";
+        cx.notify();
+      }).when(!text, (el) => el.opacity(0.5)));
+  }
+
+  // The confirmation row: the question, Cancel and the action, or a spinner while it runs
+  confirmRow(t, button, question, label) {
+    const primary = (id, text, action) => button(id, text, action).bg(t.solid).border_color(t.solid).text_color(t.solid_foreground);
+    return h_flex().items_center().gap(8)
+      .child(div().flex_1().min_w(0).truncate().text_size(12.5).child(question))
+      .when(this.acting, (el) => el.child(div().text_color(t.working).frames(SPINNER, 90)))
+      .when(!this.acting, (el) => el
+        .child(button("actions-cancel", "Cancel", (_e, cx) => { this.pending = null; cx.notify(); }))
+        .child(primary("actions-confirm", label, (_e, cx) => this.confirm(cx))));
+  }
+
+  // The selected merge request's actions: open it, retry its pipeline when it failed, comment; the
+  // writes ask before going out
+  changePanel(t, c, button) {
+    const p = this.pending;
+    return v_flex().id("change-actions").flex_none().p(12).gap(10).rounded(9).border_1().border_color(t.accent).bg(t.surface)
+      .child(h_flex().items_center().gap(8)
+        .child(div().id("change-actions-ref").flex_none().text_size(12).font_medium().text_color(t.accent).cursor_pointer()
+          .tooltip(`Open in ${this.code.name}`).on_click(() => this.browse(c)).child(c.ref))
+        .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold().child(c.title))
+        .child(h_flex().flex_none().items_center().gap(5).px(6).py(1).rounded(4).bg(t.raised)
+          .child(div().size(7).rounded_full().bg(PIPELINE_COLORS[c.pipeline] ?? t.dim))
+          .child(div().text_size(11).text_color(t.muted).child(c.pipeline ? `pipeline ${c.pipeline}` : "no pipeline")))
+        .child(h_flex().id("change-actions-close").size(24).flex_none().items_center().justify_center().rounded(6).cursor_pointer()
+          .hover((s) => s.bg(t.hover)).tooltip("Close").on_click((_e, cx) => this.pickChange(cx, c))
+          .child(div().text_size(13).text_color(t.muted).child("✕"))))
+      .child(div().truncate().text_size(11.5).text_color(t.muted).child(`${c.project.name} · ${c.branch} → ${c.target}`))
+      .when(Boolean(p), (el) => el.child(p?.retry
+        ? this.confirmRow(t, button, `Retry the failed jobs of ${c.ref}'s pipeline?`, "Retry")
+        : this.confirmRow(t, button, `Post this comment on ${c.ref}?`, "Post")))
+      .when(!p, (el) => el
+        .child(h_flex().flex_wrap().items_center().gap(6)
+          .child(button("change-open", `Open in ${this.code.name}`, () => this.browse(c)))
+          .when(this.code.retryable(c), (el) => el.child(button("change-retry", "Retry pipeline", (_e, cx) => {
+            this.pending = { retry: true };
+            this.actionError = "";
+            cx.notify();
+          }))))
+        .when(this.mention != null, (el) => el.child(this.mentionRow(t, button)))
+        .child(this.commentRow(t, button)))
+      .when(Boolean(this.actionError), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.actionError)));
+  }
+
   // The selected card's actions: where its workflow can move it, and a comment; both ask before writing
   panel(t, ticket, button) {
     const k = ticket.key;
-    const primary = (id, text, action) => button(id, text, action).bg(t.solid).border_color(t.solid).text_color(t.solid_foreground);
     const moves = Array.isArray(this.moves) ? this.moves.filter((m) => m.to !== ticket.status?.id) : [];
-    const text = this.comment.value().trim();
     const p = this.pending;
-    const q = this.mention;
-    const people = q == null || !Array.isArray(this.people) ? [] : this.people.filter((u) => fold(u.name).includes(fold(q))).slice(0, 6);
     return v_flex().id("actions").flex_none().p(12).gap(10).rounded(9).border_1().border_color(t.accent).bg(t.surface)
       .child(h_flex().items_center().gap(8)
         .child(div().id("actions-key").flex_none().text_size(12).font_medium().text_color(t.accent).cursor_pointer()
@@ -312,13 +431,9 @@ export default class Workbench extends View {
         .child(h_flex().id("actions-close").size(24).flex_none().items_center().justify_center().rounded(6).cursor_pointer()
           .hover((s) => s.bg(t.hover)).tooltip("Close").on_click((_e, cx) => this.pick(cx, ticket))
           .child(div().text_size(13).text_color(t.muted).child("✕"))))
-      .when(Boolean(p), (el) => el.child(h_flex().items_center().gap(8)
-        .child(div().flex_1().min_w(0).truncate().text_size(12.5)
-          .child(p.move ? `Move ${k} to “${p.move.name}”?` : `Post this comment on ${k}?`))
-        .when(this.acting, (el) => el.child(div().text_color(t.working).frames(SPINNER, 90)))
-        .when(!this.acting, (el) => el
-          .child(button("actions-cancel", "Cancel", (_e, cx) => { this.pending = null; cx.notify(); }))
-          .child(primary("actions-confirm", p.move ? "Move" : "Post", (_e, cx) => this.confirm(cx))))))
+      .when(Boolean(p), (el) => el.child(p?.move
+        ? this.confirmRow(t, button, `Move ${k} to “${p.move.name}”?`, "Move")
+        : this.confirmRow(t, button, `Post this comment on ${k}?`, "Post")))
       .when(!p, (el) => el
         .child(h_flex().flex_wrap().items_center().gap(6)
           .child(div().pr(4).text_size(12).text_color(t.muted).child("Move to"))
@@ -327,20 +442,8 @@ export default class Workbench extends View {
           .when(Array.isArray(this.moves) && !moves.length, (el) => el.child(div().text_size(12).text_color(t.dim).child("Nothing allowed from here")))
           .children(moves.map((m) => button(`move-${m.id}`, m.name, (_e, cx) => { this.pending = { move: m }; this.actionError = ""; cx.notify(); })
             .tooltip(m.hint))))
-        .when(q != null, (el) => el.child(h_flex().flex_wrap().items_center().gap(6)
-          .child(div().pr(4).text_size(12).text_color(t.muted).child("Mention"))
-          .when(this.people == null, (el) => el.child(div().text_color(t.working).frames(SPINNER, 90)))
-          .when(Array.isArray(this.people) && !people.length, (el) => el.child(div().text_size(12).text_color(t.dim).child(`No one called “${q}”`)))
-          .children(people.map((u) => button(`mention-${u.id}`, u.name, (_e, cx) => this.mentionPerson(cx, u))))))
-        .child(h_flex().items_end().gap(8)
-          .child(div().flex_1().min_w(0).child(Textarea.new(this.comment).w_full().px(10).py(6).rounded(8).border_1()
-            .border_color(t.input).bg(t.background).text_size(12.5).text_color(t.foreground)))
-          .child(button("actions-comment", "Comment", (_e, cx) => {
-            if (!text) return;
-            this.pending = { text, content: this.comment.content() };
-            this.actionError = "";
-            cx.notify();
-          }).when(!text, (el) => el.opacity(0.5)))))
+        .when(this.mention != null, (el) => el.child(this.mentionRow(t, button)))
+        .child(this.commentRow(t, button)))
       .when(Boolean(this.actionError), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.actionError)));
   }
 
@@ -703,6 +806,8 @@ export default class Workbench extends View {
     const tickets = (entry?.tickets ?? []).filter(isMine);
     const columns = entry?.columns ?? [];
     const sel = this.selected && ((entry?.tickets ?? []).find((x) => x.key === this.selected.key) ?? this.selected);
+    const selChange = this.selectedChange
+      && ([...(this.changes.mine ?? []), ...(this.changes.review ?? [])].find((x) => x.id === this.selectedChange.id) ?? this.selectedChange);
     // Lanes come from every ticket, so "Only mine" never turns a story into a card; empty lanes go, the plain board stays
     const shown = (entry?.lanes ?? [])
       .map((l) => ({ ...l, tickets: l.tickets.filter(isMine) }))
@@ -761,6 +866,7 @@ export default class Workbench extends View {
         .child(group("Yours", changes.mine, true))
         .child(group("To review", changes.review, false))))
       .when(!onChanges && Boolean(sel), (el) => el.child(this.panel(t, sel, button)))
+      .when(onChanges && Boolean(selChange), (el) => el.child(this.changePanel(t, selChange, button)))
       .child(h_flex().gap(8).text_size(11).text_color(t.dim)
         .child(div().flex_1().min_w(0).truncate().child(status))
         .child(div().flex_none().child(`Agents start in ${this.cwd.replace(home(), "~")}`)));

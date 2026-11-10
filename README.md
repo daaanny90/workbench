@@ -1,7 +1,9 @@
 # workbench
 
-A [Herdr](https://herdr.dev) mod for a client's tickets: its Jira boards with their own swimlanes,
-cards like Jira's, status moves and comments with @mentions. GitLab and GitHub come next.
+A [Herdr](https://herdr.dev) mod for a client's tickets and merge requests: its Jira boards with their
+own swimlanes, cards like Jira's, status moves and comments with @mentions; its GitLab merge requests,
+yours and the ones waiting for your review, with a failed pipeline's retry and comments. Every write
+asks for a confirmation first. GitHub comes next.
 
 ## Install
 

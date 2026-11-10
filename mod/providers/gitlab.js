@@ -1,53 +1,102 @@
 // GitLab as a code host: your open merge requests and the ones waiting for your review, in the
-// workbench's shape, from one GraphQL request. One instance per client and per view.
+// workbench's shape, from one GraphQL request; a failed pipeline retried, a comment with @mentions.
+// One instance per client and per view.
 //
-// A change: { id, ref ("!2098"), title, url, project: { path, name }, branch, target, draft, author,
+// A change: { id, gid, ref ("!2098"), title, url, project: { path, name }, branch, target, draft, author,
 //   pipeline: "success" | "failed" | "running" | "pending" | "canceled" | "skipped" | "manual" | … | null,
-//   approved, approvedBy: [name], threads: { open, all }, conflicts, reviewers: [name], updated }
+//   pipelineId, approved, approvedBy: [name], threads: { open, all }, conflicts, reviewers: [name], updated }
 import { post } from "../http.js";
 
-const FIELDS = `iid title webUrl draft sourceBranch targetBranch updatedAt author { name } project { fullPath name }
-  headPipeline { status } approved approvedBy { nodes { name } } resolvableDiscussionsCount resolvedDiscussionsCount
+const FIELDS = `id iid title webUrl draft sourceBranch targetBranch updatedAt author { name } project { fullPath name }
+  headPipeline { id status } approved approvedBy { nodes { name } } resolvableDiscussionsCount resolvedDiscussionsCount
   conflicts reviewers { nodes { name } }`;
-const QUERY = `query { currentUser {
+const CHANGES = `query { currentUser {
   authoredMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { nodes { ${FIELDS} } }
   reviewRequestedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { nodes { ${FIELDS} } } } }`;
+const MEMBERS = `query($p: ID!) { project(fullPath: $p) {
+  projectMembers(first: 100, relations: [DIRECT, INHERITED]) { nodes { user { username name state bot } } } } }`;
+const RETRY = "mutation($id: CiPipelineID!) { pipelineRetry(input: { id: $id }) { errors } }";
+const NOTE = "mutation($id: NoteableID!, $body: String!) { createNote(input: { noteableId: $id, body: $body }) { errors } }";
+
+// Pipelines GitLab retries: their failed jobs run again
+const RETRYABLE = new Set(["failed", "canceled"]);
 
 function change(m) {
   return {
-    id: `${m.project?.fullPath}!${m.iid}`, ref: `!${m.iid}`, title: m.title ?? "", url: m.webUrl,
+    id: `${m.project?.fullPath}!${m.iid}`, gid: m.id, ref: `!${m.iid}`, title: m.title ?? "", url: m.webUrl,
     project: { path: m.project?.fullPath ?? "", name: m.project?.name ?? "" },
     branch: m.sourceBranch ?? "", target: m.targetBranch ?? "", draft: Boolean(m.draft), author: m.author?.name ?? "",
-    pipeline: m.headPipeline?.status?.toLowerCase() ?? null,
+    pipeline: m.headPipeline?.status?.toLowerCase() ?? null, pipelineId: m.headPipeline?.id ?? null,
     approved: Boolean(m.approved), approvedBy: (m.approvedBy?.nodes ?? []).map((u) => u.name),
     threads: { open: (m.resolvableDiscussionsCount ?? 0) - (m.resolvedDiscussionsCount ?? 0), all: m.resolvableDiscussionsCount ?? 0 },
     conflicts: Boolean(m.conflicts), reviewers: (m.reviewers?.nodes ?? []).map((u) => u.name), updated: m.updatedAt,
   };
 }
 
+// The comment's text: each mention chip becomes @username, which GitLab turns into a mention.
+// Chip ranges count like JavaScript strings
+function commentBody(content) {
+  let text = content.text;
+  for (const { range, token } of [...content.tokens].sort((a, b) => b.range.start - a.range.start)) {
+    text = text.slice(0, range.start) + `@${token.id}` + text.slice(range.end);
+  }
+  return text.trim();
+}
+
+// A mutation's own errors, which come back with a 200
+function check(errors) {
+  if (errors?.length) throw new Error(errors.join(" "));
+}
+
 // config: the profile's code host, { site, keychain, vpn? }
 export function gitlabHost(config) {
   const conn = { service: "GitLab", site: config.site, header: "PRIVATE-TOKEN: @@", keychain: config.keychain };
+
+  async function gql(query, variables = {}) {
+    let found;
+    try {
+      found = await post(conn, "/api/graphql", { query, variables });
+    } catch (error) {
+      const why = String(error?.message ?? error);
+      // Behind a VPN, a closed one answers 403 or doesn't answer
+      throw new Error(config.vpn && /\b403\b|resolve host|connect|timed out|unreachable/i.test(why) ? `${why}: is the VPN on?` : why);
+    }
+    if (found?.errors?.length) throw new Error(found.errors.map((e) => e.message).join(" "));
+    return found?.data ?? {};
+  }
+
   return {
     name: "GitLab",
     changeName: "Merge request",
 
     // { mine, review }: yours and the ones waiting for your review, latest first
     async changes() {
-      let found;
-      try {
-        found = await post(conn, "/api/graphql", { query: QUERY });
-      } catch (error) {
-        const why = String(error?.message ?? error);
-        // Behind a VPN, a closed one answers 403 or doesn't answer
-        throw new Error(config.vpn && /\b403\b|resolve host|connect|timed out|unreachable/i.test(why) ? `${why}: is the VPN on?` : why);
-      }
-      if (found?.errors?.length) throw new Error(found.errors.map((e) => e.message).join(" "));
-      const me = found?.data?.currentUser;
+      const me = (await gql(CHANGES)).currentUser;
       return {
         mine: (me?.authoredMergeRequests?.nodes ?? []).map(change),
         review: (me?.reviewRequestedMergeRequests?.nodes ?? []).map(change),
       };
+    },
+
+    retryable(c) {
+      return Boolean(c.pipelineId) && RETRYABLE.has(c.pipeline);
+    },
+
+    async retry(c) {
+      check((await gql(RETRY, { id: c.pipelineId })).pipelineRetry?.errors);
+    },
+
+    // content: the comment field's text and its mention chips
+    async comment(c, content) {
+      check((await gql(NOTE, { id: c.gid, body: commentBody(content) })).createNote?.errors);
+    },
+
+    // Who can be mentioned on a merge request: its project's members, by username
+    async people(c) {
+      const nodes = (await gql(MEMBERS, { p: c.project.path })).project?.projectMembers?.nodes ?? [];
+      const seen = new Set();
+      return nodes.map((n) => n.user).filter((u) => u && u.state === "active" && !u.bot && !seen.has(u.username) && seen.add(u.username))
+        .map((u) => ({ id: u.username, name: u.name })).sort((a, b) => a.name.localeCompare(b.name));
     },
   };
 }
