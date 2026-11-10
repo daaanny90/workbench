@@ -15,9 +15,9 @@ export async function loadProfiles() {
 }
 
 // The client whose folders hold the terminal you were in (by default, the profile's own folder);
-// anywhere else, the first one
-export function clientFor(profiles, cwd) {
+// anywhere else, the first one, unless fallback is false
+export function clientFor(profiles, cwd, fallback = true) {
   const usable = profiles.filter((p) => !p.error && p.tracker);
   const inside = (folder) => { const f = folder.replace(/^~/, home()); return cwd === f || cwd.startsWith(`${f}/`); };
-  return usable.find((p) => (p.folders ?? [p.file.replace(/\/[^/]+$/, "")]).some(inside)) ?? usable[0] ?? null;
+  return usable.find((p) => (p.folders ?? [p.file.replace(/\/[^/]+$/, "")]).some(inside)) ?? (fallback ? usable[0] ?? null : null);
 }

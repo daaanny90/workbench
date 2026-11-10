@@ -21,6 +21,13 @@ copy of `main` as `layouts/workbench-column.json`, at the end of the root's `chi
   "children": [{ "id": "workbench-side", "type": "block", "content": { "mod": "workbench", "props": { "view": "sidebar" } } }] }
 ```
 
+For the sessions (every space working on a ticket or a merge request, most urgent first: an agent asking,
+one that finished, one at work, one waiting; with the ticket's title, the merge request's pipeline and the
+agents of its tabs), give a block the view `sessions`, for example in place of the Spaces list:
+`{ "mod": "workbench", "props": { "view": "sessions" } }`. A space is a ticket's session when its name or
+branch has the key, a merge request's when it's on its branch: tickets and merge requests show the state of
+their session too, and a click on it goes to its agent.
+
 ## A client
 
 One `workbench.json` per client, in `~/clients/<client>/`. The mod picks the client whose
