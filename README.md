@@ -11,6 +11,14 @@ ln -s "$PWD/mod" ~/.config/herdr-app/mods/workbench   # from this folder
 
 and bind a key in `~/.config/herdr-app/keys.json`: `"cmd-shift-b": "mod.open:workbench"`.
 
+For the sidebar (the focused space's ticket and yours), add a column to your own layout, e.g. a
+copy of `main` as `layouts/workbench-column.json`, at the end of the root's `children`:
+
+```json
+{ "id": "workbench", "type": "column", "size": { "px": 300 }, "min": 240, "max": 480, "background": "chrome",
+  "children": [{ "id": "workbench-side", "type": "block", "content": { "mod": "workbench", "props": { "view": "sidebar" } } }] }
+```
+
 ## A client
 
 One `workbench.json` per client, in `~/clients/<client>/`. The mod picks the client whose

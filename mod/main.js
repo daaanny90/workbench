@@ -11,7 +11,7 @@
 //   roger dialog (mods/roger); when roger asks which project or branch, its options become buttons.
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, TextareaState, Textarea } from "gpui-base";
-import { props, closeOverlay, theme, focused, spaces, exec, home, notify, readTextFile } from "herdr";
+import { props, openOverlay, closeOverlay, theme, focused, spaces, exec, home, notify, readTextFile, run } from "herdr";
 
 // One workbench.json per client, next to its code. See README.md for what goes in it
 const PROFILES = "~/clients/*/workbench.json";
@@ -222,8 +222,13 @@ function save(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
 
+const SIDE_FIELDS = "summary,status,priority,issuetype,assignee";
+const TICKET_KEY = /\b[A-Z][A-Z0-9]+-\d+\b/;
+
 export default class Workbench extends View {
-  init(_props, cx) {
+  init(initial, cx) {
+    this.view = props()?.view ?? initial?.view ?? null;   // "sidebar": a layout's column; else the dialog
+    if (this.view) return this.initSide(cx);
     // Read before the dialog takes the focus: the terminal you were in. A remote space's folder is not on this Mac
     const f = focused();
     const space = spaces().find((s) => s.id === f?.space);
@@ -260,7 +265,9 @@ export default class Workbench extends View {
     cx.spawn(async (cx) => {
       try {
         const profiles = await loadProfiles();
-        this.client = clientFor(profiles, this.cwd);
+        // The sidebar's Board button names its client; the shortcut goes by the terminal's folder
+        const wanted = props()?.client;
+        this.client = profiles.find((p) => wanted && p.name === wanted && !p.error && p.tracker) ?? clientFor(profiles, this.cwd);
         if (!this.client) this.problem = profiles.find((p) => p.error)?.error ?? `No client profile yet: write one as ${PROFILES}`;
         else if (this.client.tracker.kind !== "jira") this.problem = `${this.client.name}: "${this.client.tracker.kind}" trackers aren't supported yet`;
       } catch (error) {
@@ -455,6 +462,156 @@ export default class Workbench extends View {
       .when(Boolean(this.actionError), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.actionError)));
   }
 
+  // The sidebar: the focused space's ticket on top, then one section per client with your open tickets.
+  // The ticket follows the focus: its key in the space's name or branch, its client by the terminal's folder
+  initSide(cx) {
+    this.closed = false;
+    this.profiles = null;
+    this.side = { key: undefined, ticketClient: undefined, ticket: null, mine: {}, errors: {}, at: null, error: "",
+      folded: new Set(load("folded", [])) };   // client names whose section is closed
+    cx.spawn(async (cx) => {
+      try { this.profiles = await loadProfiles(); } catch (error) { this.side.error = String(error?.message ?? error); }
+      this.loadAllMine(cx);
+      cx.notify();
+    });
+    cx.timer.every(REFRESH_MS, (cx) => {
+      this.loadAllMine(cx);
+      const client = this.sideClient();
+      if (client) this.loadTicket(cx, client, this.side.key);
+    });
+  }
+
+  // The clients whose tracker this mod can read
+  sideClients() {
+    return (this.profiles ?? []).filter((p) => !p.error && p.tracker?.kind === "jira");
+  }
+
+  sideClient() {
+    return clientFor(this.profiles ?? [], focused()?.cwd ?? home());
+  }
+
+  loadAllMine(cx) {
+    for (const client of this.sideClients()) this.loadMine(cx, client);
+  }
+
+  loadMine(cx, client) {
+    const tracker = client.tracker;
+    const hidden = tracker.hiddenProjects?.length ? ` AND project not in (${tracker.hiddenProjects.join(",")})` : "";
+    cx.spawn(async (cx) => {
+      try {
+        const found = await jira(tracker, "/rest/api/3/search/jql",
+          { jql: `assignee = currentUser() AND statusCategory != Done${hidden} ORDER BY updated DESC`, fields: SIDE_FIELDS, maxResults: 20 });
+        this.side.mine[client.name] = found.issues ?? [];
+        delete this.side.errors[client.name];
+        this.side.at = new Date();
+      } catch (error) {
+        this.side.errors[client.name] = String(error?.message ?? error);
+      }
+      if (!this.closed) cx.notify();
+    });
+  }
+
+  // A client's boards, in the big window
+  openBoard(client) {
+    openOverlay({ mod: "workbench", props: { client: client.name }, kind: "dialog", width: 1320, height: 820 });
+  }
+
+  toggleClient(cx, name) {
+    if (!this.side.folded.delete(name)) this.side.folded.add(name);
+    save("folded", [...this.side.folded]);
+    cx.notify();
+  }
+
+  loadTicket(cx, client, key) {
+    if (!key) return;
+    cx.spawn(async (cx) => {
+      const ticket = await jira(client.tracker, `/rest/api/3/issue/${key}`, { fields: SIDE_FIELDS }).catch(() => false);
+      if (this.side.key !== key) return;
+      this.side.ticket = ticket;
+      if (!this.closed) cx.notify();
+    });
+  }
+
+  // The space working on a ticket, by its name or branch
+  spaceOf(key) {
+    return spaces().find((s) => `${s.name ?? ""} ${s.branch ?? ""}`.includes(key));
+  }
+
+  renderSide(cx) {
+    const t = theme();
+    const client = this.sideClient();
+    const space = spaces().find((s) => s.id === focused()?.space);
+    const key = `${space?.name ?? ""} ${space?.branch ?? ""}`.match(TICKET_KEY)?.[0] ?? null;
+    if (client && (key !== this.side.key || client.name !== this.side.ticketClient)) {
+      Object.assign(this.side, { key, ticketClient: client.name, ticket: null });
+      this.loadTicket(cx, client, key);
+    }
+    const dot = (issue) => {
+      const category = issue.fields?.status?.statusCategory?.key;
+      return div().size(8).flex_none().rounded_full().bg(category === "done" ? t.done : category === "indeterminate" ? t.working : t.dim);
+    };
+    const row = (issue, id) => {
+      const k = issue.key;
+      return h_flex().id(`mine-${id}`).flex_none().items_center().gap(7).px(8).py(5).rounded(6).cursor_pointer()
+        .hover((s) => s.bg(t.hover)).tooltip(this.spaceOf(k) ? "Go to its space" : "Open in Jira")
+        .on_click(() => { const s = this.spaceOf(k); if (s) run("space.select", { id: s.id }); else this.browse(issue); })
+        .child(dot(issue))
+        .child(div().flex_none().text_size(11.5).font_medium().text_color(t.muted).child(k))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).child(issue.fields?.summary ?? ""));
+    };
+    // A client: its name, how many tickets are open, its boards; folded, only that
+    const section = (c, ci) => {
+      const folded = this.side.folded.has(c.name);
+      const mine = this.side.mine[c.name];
+      const error = this.side.errors[c.name];
+      return v_flex().id(`client-${ci}`).flex_none().gap(1)
+        .child(h_flex().id(`client-head-${ci}`).items_center().gap(6).px(4).py(3).rounded(6).cursor_pointer()
+          .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.toggleClient(cx, c.name))
+          .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(13).flex_none().text_color(t.muted))
+          .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().child(c.name))
+          .when(Array.isArray(mine), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(String(mine.length))))
+          .child(h_flex().id(`client-board-${ci}`).h(22).px(7).flex_none().items_center().rounded(6).border_1().border_color(t.input)
+            .text_size(11).cursor_pointer().hover((s) => s.bg(t.raised)).tooltip(`${c.name}: the boards`)
+            .on_click((_e, cx) => { cx.stop_propagation(); this.openBoard(c); }).child("Board")))
+        .when(!folded, (el) => el
+          .when(mine == null && !error, (el) => el.child(div().px(8).text_color(t.working).frames(SPINNER, 90)))
+          .when(Boolean(error), (el) => el.child(div().px(8).text_size(11.5).text_color(t.blocked).child(error)))
+          .when(Array.isArray(mine) && !mine.length, (el) => el.child(div().px(8).text_size(12).text_color(t.dim).child("Nothing open")))
+          .children((mine ?? []).map((issue, i) => row(issue, `${ci}-${i}`))));
+    };
+    const clients = this.sideClients();
+    const tk = this.side.ticket;
+    const f = tk?.fields ?? {};
+    const priority = priorityMark(f.priority?.name, client?.tracker.priorityAliases);
+    const here = !key ? div().px(8).text_size(12).text_color(t.dim).child("No ticket in this space")
+      : tk === false ? div().px(8).text_size(12).text_color(t.dim).child(`${key} isn't in ${client?.name ?? "Jira"}`)
+      : !tk ? div().px(8).text_color(t.working).frames(SPINNER, 90)
+      : v_flex().id("here").flex_none().p(10).gap(6).rounded(8).border_1().border_color(t.border).bg(t.background)
+        .child(h_flex().items_center().gap(6)
+          .child(div().id("here-type").size(10).flex_none().rounded(3).bg(typeColor(f.issuetype)).tooltip(f.issuetype?.name ?? ""))
+          .child(div().id("here-key").flex_none().text_size(12).font_medium().text_color(t.accent).cursor_pointer()
+            .tooltip("Open in Jira").on_click(() => this.browse(tk)).child(tk.key))
+          .child(div().flex_1())
+          .when(Boolean(priority), (el) => el.child(div().text_size(12).font_semibold().text_color(priority.color).child(priority.glyph)))
+          .child(div().flex_none().px(6).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted).child(f.status?.name ?? "")))
+        .child(div().text_size(13).whitespace_normal().child(f.summary ?? ""))
+        .child(div().text_size(11.5).text_color(t.dim).child(f.assignee?.displayName ?? "Unassigned"));
+    const label = (text) => div().px(8).text_size(11).font_semibold().text_color(t.muted).child(text);
+    return v_flex().id("workbench-side").size_full().bg(t.chrome)
+      .min_h(0).p(10).gap(10).text_color(t.foreground)
+      .child(div().flex_none().px(4).text_size(13).font_semibold().child("Workbench"))
+      .child(label("THIS SPACE"))
+      .child(here)
+      .child(v_flex().id("clients").flex_1().min_h(0).gap(10).overflow_y_scrollbar()
+        .when(this.profiles != null && !clients.length, (el) => el.child(div().px(8).text_size(12).text_color(t.dim)
+          .child(`No client profile with a Jira tracker: write one as ${PROFILES}`)))
+        .children(clients.map(section)))
+      .children((this.profiles ?? []).filter((p) => p.error).map((p) => div().px(8).text_size(11.5).text_color(t.blocked).child(p.error)))
+      .when(Boolean(this.side.error), (el) => el.child(div().px(8).text_size(11.5).text_color(t.blocked).child(this.side.error)))
+      .child(div().flex_none().px(8).text_size(10.5).text_color(t.dim)
+        .child(this.side.at ? `updated ${this.side.at.toTimeString().slice(0, 5)}` : ""));
+  }
+
   browse(issue) {
     const origin = (issue.self ?? "").match(/^https:\/\/[^/]+/)?.[0];
     if (origin) exec("open", [`${origin}/browse/${issue.key}`]).catch(() => {});
@@ -584,7 +741,8 @@ export default class Workbench extends View {
     return v_flex().id(`lanebox-${lane.id}`).flex_none().gap(8).child(title).when(!folded, (el) => el.child(cells));
   }
 
-  render() {
+  render(cx) {
+    if (this.view) return this.renderSide(cx);
     const t = theme();
     const boards = this.client?.tracker.boards ?? [];
     const board = boards[this.board];
