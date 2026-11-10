@@ -51,7 +51,17 @@ folder holds the terminal you were in; anywhere else, the first one.
 - `folders` (optional): where the client's code lives, if not next to the profile.
 - `hiddenColumns`, `hiddenProjects`, `priorityAliases` are optional.
 - `code` (optional): the code host, for your merge requests and the ones waiting for your review. `vpn`
-  turns a 403 or no answer into "is the VPN on?". The GitLab token needs `read_api`.
+  turns a 403 or no answer into "is the VPN on?". The GitLab token needs `read_api`, and `api` to retry
+  pipelines and comment.
+- `code.tasks` (optional): the first message of an agent started on a merge request's branch, `{url}` being
+  the merge request's link: `review` for someone else's, `answer` for the review of yours. The agent starts
+  through [roger](https://github.com/daaanny90/claude-radio) (`roger open <branch> --task …`) in the
+  branch's worktree, from the repository in the client's folders whose origin is the merge request's
+  project; roger must know that repository.
+
+```json
+"tasks": { "review": "/code-review {url}", "answer": "/answer-review {url}" }
+```
 
 The token never goes in the profile. Copy it, then store it in the Keychain under the profile's
 `keychain` name:

@@ -91,6 +91,7 @@ export default class Workbench extends View {
     this.code = null;        // the client's code host's provider, if it has one: its tab follows the boards
     this.changes = { mine: null, review: null, at: null, error: "" };
     this.loadingChanges = false;
+    this.repos = null;       // code host project path -> its local checkout, found at the first agent started
     this.loading = new Set();
     this.busy = "";          // the roger command running, next to the spinner
     this.busyKey = "";
@@ -214,7 +215,19 @@ export default class Workbench extends View {
       .child(div().text_size(13).whitespace_normal().child(c.title))
       .child(div().truncate().text_size(11.5).text_color(t.dim).child(`${c.branch} → ${c.target}`))
       .child(div().text_size(11.5).text_color(c.conflicts || c.pipeline === "failed" ? t.blocked : t.muted).child(facts.join(" · ")))
-      .child(div().truncate().text_size(11.5).text_color(t.dim).child(who));
+      .child(h_flex().items_center().gap(6)
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(who))
+        .when(Boolean(this.client.code?.tasks?.[yours ? "answer" : "review"]), (el) => el.child(this.agentButton(t, c, id, yours))));
+  }
+
+  // Claude on the merge request's branch: a review of someone else's, the answers to the review of yours
+  agentButton(t, c, id, yours) {
+    const kind = yours ? "answer" : "review";
+    return h_flex().id(`change-agent-${id}`).size(24).flex_none().items_center().justify_center().rounded(6)
+      .cursor_pointer().hover((s) => s.bg(t.hover))
+      .tooltip(yours ? "Answer the review with an agent" : "Review it with an agent")
+      .on_click((_e, cx) => { cx.stop_propagation(); this.startChange(cx, c, kind); })
+      .child(this.busyKey === c.id ? div().text_color(t.working).frames(SPINNER, 90) : image("icons/claude.svg").size(14));
   }
 
   // A click on a merge request opens its actions under the list; again, closes them
@@ -385,8 +398,13 @@ export default class Workbench extends View {
         .child(primary("actions-confirm", label, (_e, cx) => this.confirm(cx))));
   }
 
-  // The selected merge request's actions: open it, retry its pipeline when it failed, comment; the
-  // writes ask before going out
+  // Yours: among the ones you opened
+  isMine(c) {
+    return (this.changes.mine ?? []).some((x) => x.id === c.id);
+  }
+
+  // The selected merge request's actions: open it, start an agent on it, retry its pipeline when it
+  // failed, comment; the writes ask before going out
   changePanel(t, c, button) {
     const p = this.pending;
     return v_flex().id("change-actions").flex_none().p(12).gap(10).rounded(9).border_1().border_color(t.accent).bg(t.surface)
@@ -407,6 +425,9 @@ export default class Workbench extends View {
       .when(!p, (el) => el
         .child(h_flex().flex_wrap().items_center().gap(6)
           .child(button("change-open", `Open in ${this.code.name}`, () => this.browse(c)))
+          .when(Boolean(this.client.code?.tasks?.[this.isMine(c) ? "answer" : "review"]), (el) => el.child(button("change-agent",
+            this.isMine(c) ? "Answer the review with an agent" : "Review with an agent",
+            (_e, cx) => this.startChange(cx, c, this.isMine(c) ? "answer" : "review"))))
           .when(this.code.retryable(c), (el) => el.child(button("change-retry", "Retry pipeline", (_e, cx) => {
             this.pending = { retry: true };
             this.actionError = "";
@@ -671,20 +692,54 @@ export default class Workbench extends View {
     if (ticket.url) exec("open", [ticket.url]).catch(() => {});
   }
 
+  // The local checkout of a code host's project (its path, "group/repo"): a repository in the client's folders
+  // whose origin is that project. Worktrees ("<repo>--<branch>") are skipped, roger finds them itself
+  async repoFor(path) {
+    if (!this.repos) {
+      const folders = (this.client.folders ?? [this.client.file.replace(/\/[^/]+$/, "")]).map((f) => f.replace(/^~/, home()));
+      const script = 'for d in "$@"; do for r in $d/*(/N); do [[ $r == *--* ]] && continue; '
+        + 'u=$(git -C $r remote get-url origin 2>/dev/null) && print -r -- "$r\t$u"; done; done';
+      const r = await exec("/bin/zsh", ["-c", script, "zsh", ...folders], { cwd: home() });
+      this.repos = new Map((r.stdout ?? "").split("\n").filter(Boolean).map((line) => {
+        const [dir, url] = line.split("\t");
+        // ssh://git@host:4222/group/repo.git, git@host:group/repo.git, https://host/group/repo
+        const project = url.replace(/\.git$/, "").replace(/^[a-z+]+:\/\/[^/]+\//, "").replace(/^[^@/]+@[^:]+:/, "");
+        return [project, dir];
+      }));
+    }
+    return this.repos.get(path) ?? null;
+  }
+
+  // An agent on a merge request's branch, through roger: in its worktree (made when missing), with the
+  // profile's first message for it: "review" for someone else's, "answer" for the review of yours
+  startChange(cx, c, kind) {
+    const task = this.client.code?.tasks?.[kind]?.replaceAll("{url}", c.url);
+    if (!task || this.busy) return;
+    cx.spawn(async (cx) => {
+      const repo = await this.repoFor(c.project.path).catch(() => null);
+      if (!repo) {
+        this.error = `${c.ref}: no checkout of ${c.project.path} in ${this.client.name}'s folders`;
+        return cx.notify();
+      }
+      await this.launch(cx, ["open", c.branch, "--task", task], { cwd: repo, key: c.id, label: c.ref });
+    });
+  }
+
   start(cx, args) {
     if (this.busy) return;
     cx.spawn(async (cx) => this.launch(cx, args));
   }
 
-  async launch(cx, args) {
-    const ticket = args[1];
+  // opts: cwd (default: the terminal you were in), key (the card showing the spinner), label (in messages)
+  async launch(cx, args, opts = {}) {
+    const ticket = opts.label ?? args[1];
     this.busy = `roger ${args.join(" ")}`;
-    this.busyKey = ticket;
+    this.busyKey = opts.key ?? args[1];
     this.error = "";
     this.choices = null;
     cx.notify();
     let r;
-    try { r = await exec("roger", args, { cwd: this.cwd, timeout: 600_000 }); }
+    try { r = await exec("roger", args, { cwd: opts.cwd ?? this.cwd, timeout: 600_000 }); }
     catch (error) { r = { code: -1, stdout: "", stderr: `roger: ${error}` }; }   // timed out, or not on the PATH
     this.busy = "";
     this.busyKey = "";
