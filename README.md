@@ -11,7 +11,9 @@ asks for a confirmation first. GitHub comes next.
 ln -s "$PWD/mod" ~/.config/herdr-app/mods/workbench   # from this folder
 ```
 
-and bind a key in `~/.config/herdr-app/keys.json`: `"cmd-shift-b": "mod.open:workbench"`.
+and bind a key in `~/.config/herdr-app/keys.json`: `"cmd-shift-b": "mod.open:workbench"`. For agents
+that tag their branch, put `bin/workbench-tag` on your `PATH`
+(`ln -s "$PWD/bin/workbench-tag" ~/.local/bin/`); it needs `jq`.
 
 For the sidebar (the focused space's ticket and yours), add a column to your own layout, e.g. a
 copy of `main` as `layouts/workbench-column.json`, at the end of the root's `children`:
@@ -27,6 +29,13 @@ agents of its tabs), give a block the view `sessions`, for example in place of t
 `{ "mod": "workbench", "props": { "view": "sessions" } }`. A space is a ticket's session when its name or
 branch has the key, a merge request's when it's on its branch: tickets and merge requests show the state of
 their session too, and a click on it goes to its agent.
+
+A branch can carry a tag, such as `R2 ✓` after a second review round or `answered`, shown on its session's row
+and on its ticket and merge request, also once the session is closed. A click on it (🏷 when there's none)
+picks the next round, a usual tag or your own, "by tag" groups the sessions by their tag, and an agent tags
+its branch with `workbench-tag TEXT`, `workbench-tag --round` or `workbench-tag --clear`. Tags and rounds are
+kept in the mod's data folder (`tags.json`). To have agents tag what they did, end the profile's `tasks` with
+it, e.g. "When you have given me the review, run `workbench-tag --round`".
 
 ## A client
 

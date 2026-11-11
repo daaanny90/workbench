@@ -1,0 +1,24 @@
+#!/bin/zsh
+# workbench-tag: tags the branch it runs on, for the workbench mod, which shows the tag on the branch's
+# session, ticket and merge request, also once the session is closed.
+#
+#   workbench-tag TEXT      the tag, e.g. "answered"
+#   workbench-tag --round   "R<n> ✓": the branch's next review round
+#   workbench-tag --clear   no tag (the rounds go on counting)
+#
+# The tags live in the mod's data folder, as { branch: { tag, round } }.
+set -e
+[[ -n ${1:-} ]] || { print -u2 "usage: workbench-tag TEXT | --round | --clear"; exit 2 }
+branch=$(git branch --show-current)
+[[ -n $branch ]] || { print -u2 "workbench-tag: not on a branch"; exit 1 }
+file=${HERDR_APP_HOME:-$HOME/.config/herdr-app}/data/workbench/tags.json
+mkdir -p ${file:h}
+[[ -s $file ]] || print '{}' > $file
+case $1 in
+  --round) filter='.[$b] = ((.[$b] // {}) | .round = ((.round // 0) + 1) | .tag = "R\(.round) ✓")' ;;
+  --clear) filter='((.[$b] // {}) | del(.tag)) as $e | if $e == {} then del(.[$b]) else .[$b] = $e end' ;;
+  *) filter='.[$b] = ((.[$b] // {}) | .tag = $t)' ;;
+esac
+jq --arg b $branch --arg t "$*" $filter $file > $file.tmp
+mv $file.tmp $file
+jq -r --arg b $branch '.[$b].tag // "no tag"' $file

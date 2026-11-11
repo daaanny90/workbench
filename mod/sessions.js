@@ -1,6 +1,13 @@
 // Sessions: the agents at work on a ticket or a merge request. A session is a Herdr space: its ticket is the
 // key in its name or branch, its merge request the one on its branch, its agents the ones in its tabs.
-import { spaces, agents } from "herdr";
+import { spaces, agents, appHome } from "herdr";
+
+// The tags, one per branch, set by hand from the mod or by an agent on the branch (bin/workbench-tag): in the
+// mod's data folder, so a merge request's "R1 ✓" outlasts its session. { branch: { tag, round } }, round
+// being the branch's review rounds so far
+export function tagsFile() {
+  return `${appHome()}/data/workbench/tags.json`;
+}
 
 export const TICKET_KEY = /\b[A-Z][A-Z0-9]+-\d+\b/;
 // Most urgent first: an agent asking, one that finished while you weren't looking, one at work, one waiting
@@ -11,8 +18,8 @@ export function urgency(status) {
 }
 
 // Every space: { space, key, branch, agents (most urgent first), status (its most urgent), since (working
-// since, ms), changed (ms) }
-export function sessions() {
+// since, ms), changed (ms), tag and round (its branch's) }
+export function sessions(tags = {}) {
   const bySpace = new Map();
   for (const a of agents()) {
     if (!bySpace.has(a.space)) bySpace.set(a.space, []);
@@ -26,8 +33,18 @@ export function sessions() {
       space: s, key: `${s.name ?? ""} ${s.branch ?? ""}`.match(TICKET_KEY)?.[0] ?? null, branch: s.branch,
       agents: list, status: list[0]?.status ?? null,
       since: working.length ? Math.min(...working) : null, changed: changed.length ? Math.max(...changed) : 0,
+      tag: branchTag(tags, s.branch), round: (s.branch && tags[s.branch]?.round) || 0,
     };
   });
+}
+
+// A branch's tag, or a ticket's: the one of a branch with its key
+export function branchTag(tags, branch) {
+  return (branch && tags[branch]?.tag) || null;
+}
+export function keyTag(tags, key) {
+  const branch = key && Object.keys(tags).find((b) => b.match(TICKET_KEY)?.[0] === key && tags[b]?.tag);
+  return branch ? tags[branch].tag : null;
 }
 
 // A merge request's session: the space on its branch

@@ -9,15 +9,17 @@
 // - Start: the agent button runs `roger open <key>` in the folder of the terminal you were in, like the
 //   roger dialog (mods/roger); when roger asks which project or branch, its options become buttons.
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex, TextareaState, Textarea } from "gpui-base";
-import { props, openOverlay, closeOverlay, theme, focused, spaces, exec, home, notify, run } from "herdr";
+import { v_flex, h_flex, TextareaState, Textarea, InputState, Input } from "gpui-base";
+import { props, openOverlay, closeOverlay, theme, focused, spaces, exec, home, notify, run, readTextFile,
+  writeTextFile } from "herdr";
 import { failure } from "./http.js";
 import { PROFILES, loadProfiles, clientFor } from "./profiles.js";
 import { jiraTracker } from "./providers/jira.js";
 import { gitlabHost } from "./providers/gitlab.js";
-import { TICKET_KEY, sessions, onBranch, ofKey, urgency, elapsed } from "./sessions.js";
+import { TICKET_KEY, sessions, onBranch, ofKey, urgency, elapsed, tagsFile, branchTag, keyTag } from "./sessions.js";
 
 const REFRESH_MS = 60_000;
+const TAGS_MS = 2_000;   // how often the tags file is read: agents change it too
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // A session's state in words, by its most urgent agent
 const SESSION_WORDS = { blocked: "needs you", done: "finished", working: "working", idle: "idle" };
@@ -83,6 +85,7 @@ export default class Workbench extends View {
   init(initial, cx) {
     // "sidebar": tickets and merge requests by client; "sessions": the agents at work on them; else the dialog
     this.view = props()?.view ?? initial?.view ?? null;
+    this.watchTags(cx);
     if (this.view === "sessions") return this.initSessions(cx);
     if (this.view) return this.initSide(cx);
     // Read before the dialog takes the focus: the terminal you were in. A remote space's folder is not on this Mac
@@ -226,7 +229,7 @@ export default class Workbench extends View {
       .child(div().text_size(11.5).text_color(c.conflicts || c.pipeline === "failed" ? t.blocked : t.muted).child(facts.join(" · ")))
       .child(h_flex().items_center().gap(6)
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(who))
-        .when(Boolean(onBranch(this.sessionList, c.branch)), (el) => el.child(this.sessionBadge(t, onBranch(this.sessionList, c.branch), `c-${id}`)))
+        .children([this.changeBadge(t, c, `c-${id}`)].filter(Boolean))
         .when(Boolean(this.client.code?.tasks?.[yours ? "answer" : "review"]), (el) => el.child(this.agentButton(t, c, id, yours))));
   }
 
@@ -605,7 +608,7 @@ export default class Workbench extends View {
         .child(dot(ticket))
         .child(div().flex_none().text_size(11.5).font_medium().text_color(t.muted).child(k))
         .child(div().flex_1().min_w(0).truncate().text_size(12).child(ticket.title ?? ""))
-        .when(Boolean(ofKey(this.sessionList, k)), (el) => el.child(this.sessionBadge(t, ofKey(this.sessionList, k), `s-${id}`, true)));
+        .children([this.ticketBadge(t, k, `s-${id}`, true)].filter(Boolean));
     };
     const changeRow = (change, id, host) => {
       const s = this.spaceOfBranch(change.branch);
@@ -617,7 +620,7 @@ export default class Workbench extends View {
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(change.draft ? t.muted : t.foreground).child(change.title))
         .when(change.threads.open > 0 || change.conflicts, (el) => el.child(div().flex_none().text_size(11).text_color(t.blocked)
           .child(change.conflicts ? "!" : `${change.threads.open}💬`)))
-        .when(Boolean(onBranch(this.sessionList, change.branch)), (el) => el.child(this.sessionBadge(t, onBranch(this.sessionList, change.branch), `sc-${id}`, true)));
+        .children([this.changeBadge(t, change, `sc-${id}`, true)].filter(Boolean));
     };
     const small = (text) => div().px(8).pt(4).text_size(10.5).font_semibold().text_color(t.dim).child(text);
     // A client's merge requests, under its tickets: yours, then the ones waiting for your review
@@ -727,16 +730,83 @@ export default class Workbench extends View {
   }
 
   // A ticket's or a merge request's session at a glance: the state of its most urgent agent, how long it
-  // has been working, its agents in the tooltip; a click goes to that agent. Compact: the dot, and the time
-  // while working
+  // has been working, its tag, its agents in the tooltip; a click goes to that agent. Compact: the dot, the
+  // time while working, the tag
   sessionBadge(t, s, id, compact = false) {
-    const words = s.status === "working" && s.since ? elapsed(s.since) : SESSION_WORDS[s.status] ?? "no agent";
+    const state = s.status === "working" && s.since ? elapsed(s.since) : SESSION_WORDS[s.status] ?? "no agent";
+    const words = [compact && s.status !== "working" ? null : state, s.tag].filter(Boolean).join(" · ");
     const tabs = s.agents.map((a) => `${tabName(a)}: ${SESSION_WORDS[a.status] ?? a.status}`).join(" · ");
     return h_flex().id(`session-${id}`).flex_none().items_center().gap(4).px(5).py(1).rounded(4).bg(t.raised)
       .cursor_pointer().hover((st) => st.opacity(0.8)).tooltip(`${s.key ?? s.space.name} · ${tabs || "no agent"}`)
       .on_click((_e, cx) => { cx.stop_propagation(); this.focusSession(s); })
       .child(this.statusDot(t, s.status))
-      .when(!compact || s.status === "working", (el) => el.child(div().text_size(10.5).text_color(t.muted).child(words)));
+      .when(Boolean(words), (el) => el.child(div().text_size(10.5).text_color(t.muted).child(words)));
+  }
+
+  tagPill(t, id, tag) {
+    return div().id(id).flex_none().max_w(110).truncate().px(5).py(1).rounded(4).bg(t.selected)
+      .text_size(10.5).font_medium().text_color(t.accent).child(tag);
+  }
+
+  // A merge request's or a ticket's badge: its session's, or its branch's tag once no session is on it
+  changeBadge(t, c, id, compact = false) {
+    const s = onBranch(this.sessionList, c.branch);
+    if (s) return this.sessionBadge(t, s, id, compact);
+    const tag = branchTag(this.tags, c.branch);
+    return tag ? this.tagPill(t, `tag-${id}`, tag) : null;
+  }
+  ticketBadge(t, key, id, compact = false) {
+    const s = ofKey(this.sessionList, key);
+    if (s) return this.sessionBadge(t, s, id, compact);
+    const tag = keyTag(this.tags, key);
+    return tag ? this.tagPill(t, `tag-${id}`, tag) : null;
+  }
+
+  // The tags file, read now and every few seconds: an agent may have changed it
+  watchTags(cx) {
+    this.tags = {};
+    this.tagsText = undefined;
+    const read = (cx) => cx.spawn(async (cx) => {
+      const text = await readTextFile(tagsFile()).catch(() => null);
+      if (text === this.tagsText) return;
+      this.tagsText = text;
+      try { this.tags = text ? JSON.parse(text) : {}; } catch { this.tags = {}; }
+      if (!this.closed) cx.notify();
+    });
+    read(cx);
+    cx.timer.every(TAGS_MS, read);
+  }
+
+  // A session's branch's tag: text, or the next review round, or none (""), the rounds counting on. Written
+  // only if nobody changed the file meanwhile
+  setTag(cx, s, text, round = false) {
+    this.tagging = null;
+    if (!s.branch) return cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const before = await readTextFile(tagsFile());
+        const tags = before ? JSON.parse(before) : {};
+        const entry = tags[s.branch] ?? {};
+        if (round) entry.round = (entry.round ?? 0) + 1;
+        entry.tag = round ? `R${entry.round} ✓` : text || undefined;
+        if (entry.tag || entry.round) tags[s.branch] = entry; else delete tags[s.branch];
+        const after = `${JSON.stringify(tags, null, 2)}\n`;
+        await writeTextFile(tagsFile(), after, before);
+        this.tags = tags;
+        this.tagsText = after;
+      } catch (error) {
+        notify({ title: `${s.key ?? s.space.name}: no tag`, body: String(error?.message ?? error), level: "error" });
+      }
+      if (!this.closed) cx.notify();
+    });
+    cx.notify();
+  }
+
+  // The tag picker under a session: the next review round, the usual ones, none, or your own
+  openTagging(cx, s) {
+    this.tagging = this.tagging === s.space.id ? null : s.space.id;
+    this.tagInput.set_value("");
+    cx.notify();
   }
 
   // The left column's sessions: the profiles, and every client's merge requests, to show on each session
@@ -747,6 +817,14 @@ export default class Workbench extends View {
     this.hosts = new Map();
     this.titles = new Map();   // ticket key -> its title, or null when its tracker doesn't have it
     this.sessionChanges = {};  // client name -> { mine, review }
+    this.tagging = null;       // the space whose tag picker is open
+    this.byTag = load("sessionsByTag", false);   // grouped by tag, or most urgent first
+    this.tagInput = InputState.new({ placeholder: "Your tag, Enter" });
+    this.tagInput.on("submit", (_e, cx) => {
+      const s = sessions(this.tags).find((x) => x.space.id === this.tagging);
+      const text = this.tagInput.value().trim();
+      if (s && text) this.setTag(cx, s, text);
+    });
     cx.spawn(async (cx) => {
       try { this.profiles = await loadProfiles(); } catch {}
       this.loadSessionChanges(cx);
@@ -786,7 +864,7 @@ export default class Workbench extends View {
   // Sessions on tickets or merge requests, most urgent first, then the other spaces
   renderSessions(cx) {
     const t = theme();
-    const list = sessions();
+    const list = sessions(this.tags);
     const changes = Object.values(this.sessionChanges).flatMap((f) => [...f.mine, ...f.review]);
     const changesOf = (s) => (s.branch ? changes.filter((c) => c.branch === s.branch) : []);
     const work = list.filter((s) => s.key || changesOf(s).length)
@@ -797,6 +875,19 @@ export default class Workbench extends View {
       .on_click((_e, cx) => { cx.stop_propagation(); this.focusAgent(a); })
       .child(this.statusDot(t, a.status))
       .child(div().text_size(10.5).text_color(t.muted).child(tabName(a)));
+    const pill = (id, tag) => this.tagPill(t, id, tag);
+    const small = (id, text, action) => h_flex().id(id).flex_none().h(22).px(7).items_center().rounded(5).border_1()
+      .border_color(t.input).bg(t.raised).text_size(11).cursor_pointer().hover((st) => st.bg(t.hover))
+      .on_click((_e, cx) => { cx.stop_propagation(); action(cx); }).child(text);
+    // Under the session: the next round, the usual tags, none, your own
+    const picker = (s, i) => v_flex().id(`tagging-${i}`).pl(14).gap(5).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .child(h_flex().flex_wrap().items_center().gap(4)
+          .child(div().text_size(10.5).text_color(t.dim).child("Tag as"))
+          .child(small(`tag-round-${i}`, `R${s.round + 1} ✓`, (cx) => this.setTag(cx, s, "", true)))
+          .children(["answered", "waiting", "blocked"].map((tag) => small(`tag-${tag}-${i}`, tag, (cx) => this.setTag(cx, s, tag))))
+          .when(Boolean(s.tag), (el) => el.child(small(`tag-none-${i}`, "✕", (cx) => this.setTag(cx, s, "")))))
+        .child(div().id(`tag-input-${i}`).on_click((_e, cx) => cx.stop_propagation())
+          .child(Input.new(this.tagInput).w_full().h(26).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(11.5)));
     const row = (s, i) => {
       const title = this.sessionTitle(cx, s);
       return v_flex().id(`session-row-${i}`).flex_none().gap(3).px(8).py(6).rounded(6).cursor_pointer()
@@ -806,7 +897,14 @@ export default class Workbench extends View {
           .child(this.statusDot(t, s.status))
           .child(div().flex_none().text_size(12).font_semibold().child(s.key ?? s.space.name))
           .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(title ?? ""))
-          .when(s.status === "working" && Boolean(s.since), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(elapsed(s.since)))))
+          .when(s.status === "working" && Boolean(s.since), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(elapsed(s.since))))
+          // Its branch's tag, or 🏷 when none: a click opens the picker
+          .when(Boolean(s.branch), (el) => el.child(h_flex().id(`tag-open-${i}`).flex_none().min_w(20).h(20)
+            .items_center().justify_center().rounded(5).hover((st) => st.bg(t.raised))
+            .tooltip(s.tag ? "Change the tag" : "Tag this branch")
+            .on_click((_e, cx) => { cx.stop_propagation(); this.openTagging(cx, s); })
+            .when(!s.tag, (el) => el.child(div().text_size(11).text_color(this.tagging === s.space.id ? t.accent : t.dim).child("🏷")))
+            .when(Boolean(s.tag), (el) => el.child(pill(`tag-${i}`, s.tag))))))
         .children(changesOf(s).map((c, ci) => h_flex().id(`session-change-${i}-${ci}`).pl(14).items_center().gap(5).text_size(11)
           .cursor_pointer().tooltip(`Open ${c.ref} on the code host`).on_click((_e, cx) => { cx.stop_propagation(); this.browse(c); })
           .child(div().size(6).flex_none().rounded_full().bg(PIPELINE_COLORS[c.pipeline] ?? t.dim))
@@ -814,22 +912,40 @@ export default class Workbench extends View {
           .child(div().flex_1().min_w(0).truncate().text_color(c.conflicts || c.pipeline === "failed" ? t.blocked : t.dim)
             .child(changeFacts(c).join(" · ")))))
         .when(s.agents.length > 0, (el) => el.child(h_flex().pl(14).flex_wrap().gap(4)
-          .children(s.agents.map((a, ai) => chip(a, `${i}-${ai}`)))));
+          .children(s.agents.map((a, ai) => chip(a, `${i}-${ai}`)))))
+        .when(this.tagging === s.space.id, (el) => el.child(picker(s, i)));
     };
     const needs = work.filter((s) => s.status === "blocked" || s.status === "done").length;
     const label = (text) => div().px(8).pt(4).text_size(10.5).font_semibold().text_color(t.dim).child(text);
+    // By tag: a group per tag, then the untagged ones, then the other spaces
+    const tagOf = (s) => s.tag;
+    const tagged = [...work, ...others].filter(tagOf);
+    const names = [...new Set(tagged.map(tagOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const groups = this.byTag
+      ? [...names.map((name) => ({ tag: name, list: tagged.filter((s) => tagOf(s) === name) })),
+        { name: "NO TAG", list: work.filter((s) => !tagOf(s)) }, { name: "OTHER SPACES", list: others.filter((s) => !tagOf(s)) }]
+      : [{ list: work }, { name: "OTHER SPACES", list: others }];
+    let n = 0;   // rows' ids, across the groups
+    const group = (g, gi) => [
+      ...(g.tag ? [h_flex().px(8).pt(4).gap(5).items_center().child(pill(`group-${gi}`, g.tag))
+        .child(div().text_size(10.5).text_color(t.dim).child(String(g.list.length)))] : []),
+      ...(g.name && g.list.length ? [label(g.name)] : []),
+      ...g.list.map((s) => row(s, n++)),
+    ];
     return v_flex().id("workbench-sessions").size_full().min_h(0).bg(t.chrome).p(8).gap(6).text_color(t.foreground)
       .child(h_flex().flex_none().items_center().gap(6).px(6)
         .child(div().flex_1().text_size(13).font_semibold().child("Sessions"))
         .when(needs > 0, (el) => el.child(div().text_size(11).text_color(t.blocked).child(`${needs} need${needs === 1 ? "s" : ""} you`)))
+        .child(h_flex().id("session-group").h(22).px(6).items_center().rounded(6).cursor_pointer().hover((st) => st.bg(t.hover))
+          .tooltip(this.byTag ? "Most urgent first" : "Group by tag")
+          .on_click((_e, cx) => { this.byTag = !this.byTag; save("sessionsByTag", this.byTag); cx.notify(); })
+          .child(div().text_size(11).text_color(this.byTag ? t.accent : t.muted).child("by tag")))
         .child(h_flex().id("session-new").size(22).items_center().justify_center().rounded(6).cursor_pointer()
           .hover((st) => st.bg(t.hover)).tooltip("New space").on_click(() => run("space.new", {}))
           .child(div().text_size(14).text_color(t.muted).child("+"))))
       .child(v_flex().id("session-list").flex_1().min_h(0).gap(2).overflow_y_scrollbar()
         .when(!work.length, (el) => el.child(div().px(8).text_size(12).text_color(t.dim).child("No agent on a ticket yet")))
-        .children(work.map(row))
-        .when(others.length > 0, (el) => el.child(label("OTHER SPACES")))
-        .children(others.map((s, i) => row(s, work.length + i))));
+        .children(groups.flatMap(group)));
   }
 
   // The local checkout of a code host's project (its path, "group/repo"): a repository in the client's folders
@@ -944,7 +1060,7 @@ export default class Workbench extends View {
           .child(div().flex_1())
           .when(Boolean(priority), (el) => el.child(div().id(`prio-${k}`).flex_none().text_size(12.5).font_semibold()
             .text_color(priority.color).tooltip(ticket.priority.name).child(priority.glyph)))
-          .when(Boolean(ofKey(this.sessionList, k)), (el) => el.child(this.sessionBadge(t, ofKey(this.sessionList, k), `t-${k}`, true)))
+          .children([this.ticketBadge(t, k, `t-${k}`, true)].filter(Boolean))
           .child(avatar)
           .child(h_flex().id(`start-${k}`).size(24).flex_none().items_center().justify_center().rounded(6)
             .cursor_pointer().hover((s) => s.bg(t.hover)).tooltip(`roger open ${k}`)
@@ -991,7 +1107,7 @@ export default class Workbench extends View {
 
   render(cx) {
     if (this.view === "sessions") return this.renderSessions(cx);
-    this.sessionList = sessions();   // for the cards' session badges
+    this.sessionList = sessions(this.tags);   // for the cards' session badges
     if (this.view) return this.renderSide(cx);
     const t = theme();
     const boards = this.tracker?.boards ?? [];
