@@ -1,11 +1,20 @@
 // Clients: one workbench.json each, next to its code. See README.md for what goes in it.
-import { exec, home, readTextFile } from "herdr";
+import { exec, home, appHome, readTextFile } from "herdr";
 
-export const PROFILES = "~/clients/*/workbench.json";
+// Where the profiles are, a zsh glob: "profiles" in the mod's data folder's config.json, or else this
+const PROFILES = "~/clients/*/workbench.json";
+let glob = PROFILES;
+
+// The glob the last loadProfiles read
+export function profilesGlob() {
+  return glob;
+}
 
 // Every client's profile, { file, name, tracker }, or { file, error } when it can't be read
 export async function loadProfiles() {
-  const r = await exec("/bin/zsh", ["-c", `print -rl -- ${PROFILES}(N)`], { cwd: home() });
+  try { glob = JSON.parse(await readTextFile(`${appHome()}/data/workbench/config.json`)).profiles ?? PROFILES; }
+  catch { glob = PROFILES; }
+  const r = await exec("/bin/zsh", ["-c", `print -rl -- ${glob}(N)`], { cwd: home() });
   const profiles = [];
   for (const file of (r.stdout ?? "").split("\n").filter(Boolean)) {
     try { profiles.push({ file, ...JSON.parse(await readTextFile(file)) }); }

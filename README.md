@@ -40,7 +40,9 @@ it, e.g. "When you have given me the review, run `workbench-tag --round`".
 ## A client
 
 One `workbench.json` per client, in `~/clients/<client>/`. The mod picks the client whose
-folder holds the terminal you were in; anywhere else, the first one.
+folder holds the terminal you were in; anywhere else, the first one. To keep them elsewhere, put a zsh glob
+in the mod's data folder, `~/.config/herdr-app/data/workbench/config.json`:
+`{ "profiles": "~/work/*/workbench.json" }`.
 
 ```json
 {

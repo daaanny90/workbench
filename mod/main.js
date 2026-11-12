@@ -13,7 +13,7 @@ import { v_flex, h_flex, TextareaState, Textarea, InputState, Input } from "gpui
 import { props, openOverlay, closeOverlay, theme, focused, spaces, exec, home, notify, run, readTextFile,
   writeTextFile } from "herdr";
 import { failure } from "./http.js";
-import { PROFILES, loadProfiles, clientFor } from "./profiles.js";
+import { profilesGlob, loadProfiles, clientFor } from "./profiles.js";
 import { jiraTracker } from "./providers/jira.js";
 import { gitlabHost } from "./providers/gitlab.js";
 import { TICKET_KEY, sessions, onBranch, ofKey, urgency, elapsed, tagsFile, branchTag, keyTag } from "./sessions.js";
@@ -135,7 +135,7 @@ export default class Workbench extends View {
         this.client = profiles.find((p) => wanted && p.name === wanted && !p.error && p.tracker) ?? clientFor(profiles, this.cwd);
         this.tracker = trackerOf(this.client);
         this.code = codeOf(this.client);
-        if (!this.client) this.problem = profiles.find((p) => p.error)?.error ?? `No client profile yet: write one as ${PROFILES}`;
+        if (!this.client) this.problem = profiles.find((p) => p.error)?.error ?? `No client profile yet: write one as ${profilesGlob()}`;
         else if (!this.tracker) this.problem = `${this.client.name}: "${this.client.tracker.kind}" trackers aren't supported yet`;
       } catch (error) {
         this.problem = `Client profiles: ${error?.message ?? error}`;
@@ -695,7 +695,7 @@ export default class Workbench extends View {
       .when(Boolean(hc), (el) => el.child(hereChange))
       .child(v_flex().id("clients").flex_1().min_h(0).gap(10).overflow_y_scrollbar()
         .when(this.profiles != null && !clients.length, (el) => el.child(div().px(8).text_size(12).text_color(t.dim)
-          .child(`No client profile with a tracker this mod reads: write one as ${PROFILES}`)))
+          .child(`No client profile with a tracker this mod reads: write one as ${profilesGlob()}`)))
         .children(clients.map(section)))
       .children((this.profiles ?? []).filter((p) => p.error).map((p) => div().px(8).text_size(11.5).text_color(t.blocked).child(p.error)))
       .when(Boolean(this.side.error), (el) => el.child(div().px(8).text_size(11.5).text_color(t.blocked).child(this.side.error)))
