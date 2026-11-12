@@ -3,7 +3,8 @@
 A [Herdr](https://herdr.dev) mod for a client's tickets and merge requests: its Jira boards with their
 own swimlanes, cards like Jira's, status moves and comments with @mentions; its GitLab merge requests,
 yours and the ones waiting for your review, with a failed pipeline's retry and comments. Every write
-asks for a confirmation first. GitHub comes next.
+asks for a confirmation first, but for one: a review agent adds you to the merge request's reviewers.
+GitHub comes next.
 
 ## Install
 
@@ -70,15 +71,16 @@ in the mod's data folder, `~/.config/herdr-app/data/workbench/config.json`:
 - `hiddenColumns`, `hiddenProjects`, `priorityAliases` are optional.
 - `code` (optional): the code host, for your merge requests and the ones waiting for your review. `vpn`
   turns a 403 or no answer into "is the VPN on?". The GitLab token needs `read_api`, and `api` to retry
-  pipelines and comment.
+  pipelines, comment and add you as a reviewer.
 - `code.unassigned` (optional): `{ "groups": ["acme"], "skipAuthors": ["renovate-bot"] }` adds the open merge
   requests nobody reviews yet (drafts aside) in those groups and their subgroups, except yours and the ones
   by the authors it skips (usernames).
 - `code.tasks` (optional): the first message of an agent started on a merge request's branch, `{url}` being
-  the merge request's link: `review` for someone else's, `answer` for the review of yours. The agent starts
-  through [roger](https://github.com/daaanny90/claude-radio) (`roger open <branch> --task …`) in the
-  branch's worktree, from the repository in the client's folders whose origin is the merge request's
-  project; roger must know that repository.
+  the merge request's link: `review` for someone else's (which adds you to its reviewers, when you aren't one
+  yet), `answer` for the review of yours. The agent starts through
+  [roger](https://github.com/daaanny90/claude-radio) (`roger open <branch> --task …`) in the branch's
+  worktree, from the repository in the client's folders whose origin is the merge request's project; roger
+  must know that repository.
 
 ```json
 "tasks": { "review": "/code-review {url}", "answer": "/answer-review {url}" }

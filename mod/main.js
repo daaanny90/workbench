@@ -238,7 +238,7 @@ export default class Workbench extends View {
     const kind = yours ? "answer" : "review";
     return h_flex().id(`change-agent-${id}`).size(24).flex_none().items_center().justify_center().rounded(6)
       .cursor_pointer().hover((s) => s.bg(t.hover))
-      .tooltip(yours ? "Answer the review with an agent" : "Review it with an agent")
+      .tooltip(yours ? "Answer the review with an agent" : "Review it with an agent (adds you as a reviewer)")
       .on_click((_e, cx) => { cx.stop_propagation(); this.startChange(cx, c, kind); })
       .child(this.busyKey === c.id ? div().text_color(t.working).frames(SPINNER, 90) : image("icons/claude.svg").size(14));
   }
@@ -972,7 +972,8 @@ export default class Workbench extends View {
   }
 
   // An agent on a merge request's branch, through roger: in its worktree (made when missing), with the
-  // profile's first message for it: "review" for someone else's, "answer" for the review of yours
+  // profile's first message for it: "review" for someone else's, "answer" for the review of yours.
+  // A review makes you one of its reviewers first, when you aren't
   startChange(cx, c, kind) {
     const task = this.client.code?.tasks?.[kind]?.replaceAll("{url}", c.url);
     if (!task || this.busy) return;
@@ -981,6 +982,13 @@ export default class Workbench extends View {
       if (!repo) {
         this.error = `${c.ref}: no checkout of ${c.project.path} in ${this.client.name}'s folders`;
         return cx.notify();
+      }
+      if (kind === "review") {
+        try { await this.code.becomeReviewer(c); }
+        catch (error) {
+          this.error = `${c.ref}: you couldn't be added as a reviewer: ${error?.message ?? error}`;
+          return cx.notify();
+        }
       }
       await this.launch(cx, ["open", c.branch, "--task", task], { cwd: repo, key: c.id, label: c.ref });
     });
