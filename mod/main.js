@@ -893,9 +893,11 @@ export default class Workbench extends View {
       return v_flex().id(`session-row-${i}`).flex_none().gap(3).px(8).py(6).rounded(6).cursor_pointer()
         .when(s.space.active, (el) => el.bg(t.selected)).hover((st) => st.bg(t.hover))
         .on_click(() => run("space.select", { id: s.space.id }))
+        // Herdr's own space menu (Rename, worktrees, Close), as its spaces sidebar opens it
+        .on_mouse_down("right", () => openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: s.space.id } } }))
         .child(h_flex().items_center().gap(6)
           .child(this.statusDot(t, s.status))
-          .child(div().flex_none().text_size(12).font_semibold().child(s.key ?? s.space.name))
+          .child(div().flex_none().text_size(12).font_semibold().child(s.space.named ? s.space.name : s.key ?? s.space.name))
           .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(title ?? ""))
           .when(s.status === "working" && Boolean(s.since), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(elapsed(s.since))))
           // Its branch's tag, or 🏷 when none: a click opens the picker
