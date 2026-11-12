@@ -71,6 +71,9 @@ in the mod's data folder, `~/.config/herdr-app/data/workbench/config.json`:
 - `code` (optional): the code host, for your merge requests and the ones waiting for your review. `vpn`
   turns a 403 or no answer into "is the VPN on?". The GitLab token needs `read_api`, and `api` to retry
   pipelines and comment.
+- `code.unassigned` (optional): `{ "groups": ["acme"], "skipAuthors": ["renovate-bot"] }` adds the open merge
+  requests nobody reviews yet (drafts aside) in those groups and their subgroups, except yours and the ones
+  by the authors it skips (usernames).
 - `code.tasks` (optional): the first message of an agent started on a merge request's branch, `{url}` being
   the merge request's link: `review` for someone else's, `answer` for the review of yours. The agent starts
   through [roger](https://github.com/daaanny90/claude-radio) (`roger open <branch> --task …`) in the

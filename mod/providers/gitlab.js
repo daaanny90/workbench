@@ -1,18 +1,22 @@
-// GitLab as a code host: your open merge requests and the ones waiting for your review, in the
-// workbench's shape, from one GraphQL request; a failed pipeline retried, a comment with @mentions.
+// GitLab as a code host: your open merge requests, the ones waiting for your review and the ones nobody
+// reviews yet, in the workbench's shape, from one GraphQL request; a failed pipeline retried, a comment
+// with @mentions.
 // One instance per client and per view.
 //
 // A change: { id, gid, ref ("!2098"), title, url, project: { path, name }, branch, target, draft, author,
-//   pipeline: "success" | "failed" | "running" | "pending" | "canceled" | "skipped" | "manual" | … | null,
+//   authorId (username), pipeline: "success" | "failed" | "running" | "pending" | "canceled" | "skipped" | "manual" | … | null,
 //   pipelineId, approved, approvedBy: [name], threads: { open, all }, conflicts, reviewers: [name], updated }
 import { post } from "../http.js";
 
-const FIELDS = `id iid title webUrl draft sourceBranch targetBranch updatedAt author { name } project { fullPath name }
+const FIELDS = `id iid title webUrl draft sourceBranch targetBranch updatedAt author { name username } project { fullPath name }
   headPipeline { id status } approved approvedBy { nodes { name } } resolvableDiscussionsCount resolvedDiscussionsCount
   conflicts reviewers { nodes { name } }`;
-const CHANGES = `query { currentUser {
+// groups: where to look for the open merge requests without a reviewer (drafts aside), subgroups included
+const changesQuery = (groups) => `query { currentUser { username
   authoredMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { nodes { ${FIELDS} } }
-  reviewRequestedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { nodes { ${FIELDS} } } } }`;
+  reviewRequestedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { nodes { ${FIELDS} } } }
+  ${groups.map((g, i) => `g${i}: group(fullPath: ${JSON.stringify(g)}) { mergeRequests(state: opened, draft: false,
+    reviewerWildcardId: NONE, includeSubgroups: true, first: 50, sort: UPDATED_DESC) { nodes { ${FIELDS} } } }`).join("\n  ")} }`;
 const MEMBERS = `query($p: ID!) { project(fullPath: $p) {
   projectMembers(first: 100, relations: [DIRECT, INHERITED]) { nodes { user { username name state bot } } } } }`;
 const RETRY = "mutation($id: CiPipelineID!) { pipelineRetry(input: { id: $id }) { errors } }";
@@ -26,6 +30,7 @@ function change(m) {
     id: `${m.project?.fullPath}!${m.iid}`, gid: m.id, ref: `!${m.iid}`, title: m.title ?? "", url: m.webUrl,
     project: { path: m.project?.fullPath ?? "", name: m.project?.name ?? "" },
     branch: m.sourceBranch ?? "", target: m.targetBranch ?? "", draft: Boolean(m.draft), author: m.author?.name ?? "",
+    authorId: m.author?.username ?? "",
     pipeline: m.headPipeline?.status?.toLowerCase() ?? null, pipelineId: m.headPipeline?.id ?? null,
     approved: Boolean(m.approved), approvedBy: (m.approvedBy?.nodes ?? []).map((u) => u.name),
     threads: { open: (m.resolvableDiscussionsCount ?? 0) - (m.resolvedDiscussionsCount ?? 0), all: m.resolvableDiscussionsCount ?? 0 },
@@ -48,7 +53,7 @@ function check(errors) {
   if (errors?.length) throw new Error(errors.join(" "));
 }
 
-// config: the profile's code host, { site, keychain, vpn? }
+// config: the profile's code host, { site, keychain, vpn?, unassigned?: { groups, skipAuthors? } }
 export function gitlabHost(config) {
   const conn = { service: "GitLab", site: config.site, header: "PRIVATE-TOKEN: @@", keychain: config.keychain };
 
@@ -69,12 +74,19 @@ export function gitlabHost(config) {
     name: "GitLab",
     changeName: "Merge request",
 
-    // { mine, review }: yours and the ones waiting for your review, latest first
+    // { mine, review, unassigned }: yours, the ones waiting for your review, and the others nobody reviews
+    // yet in the profile's groups (but the authors it skips, such as a bot); latest first
     async changes() {
-      const me = (await gql(CHANGES)).currentUser;
+      const groups = config.unassigned?.groups ?? [];
+      const skip = new Set(config.unassigned?.skipAuthors ?? []);
+      const data = await gql(changesQuery(groups));
+      const me = data.currentUser;
       return {
         mine: (me?.authoredMergeRequests?.nodes ?? []).map(change),
         review: (me?.reviewRequestedMergeRequests?.nodes ?? []).map(change),
+        unassigned: groups.flatMap((_g, i) => data[`g${i}`]?.mergeRequests?.nodes ?? []).map(change)
+          .filter((c) => c.authorId !== me?.username && !skip.has(c.authorId))
+          .sort((a, b) => (b.updated ?? "").localeCompare(a.updated ?? "")),
       };
     },
 

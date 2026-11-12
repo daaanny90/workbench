@@ -101,7 +101,7 @@ export default class Workbench extends View {
     this.me = null;          // your id in the tracker, for "Only mine"
     this.boards = {};        // board id -> { columns, lanes, tickets, total, at, error }
     this.code = null;        // the client's code host's provider, if it has one: its tab follows the boards
-    this.changes = { mine: null, review: null, at: null, error: "" };
+    this.changes = { mine: null, review: null, unassigned: null, at: null, error: "" };
     this.loadingChanges = false;
     this.repos = null;       // code host project path -> its local checkout, found at the first agent started
     this.loading = new Set();
@@ -623,7 +623,7 @@ export default class Workbench extends View {
         .children([this.changeBadge(t, change, `sc-${id}`, true)].filter(Boolean));
     };
     const small = (text) => div().px(8).pt(4).text_size(10.5).font_semibold().text_color(t.dim).child(text);
-    // A client's merge requests, under its tickets: yours, then the ones waiting for your review
+    // A client's merge requests, under its tickets: yours, the ones waiting for your review, the ones nobody reviews
     const changesOf = (c, ci) => {
       const host = this.hostFor(c);
       const found = this.side.changes[c.name];
@@ -635,7 +635,10 @@ export default class Workbench extends View {
           .child(small(`YOUR ${host.changeName.toUpperCase()}S · ${found.mine.length}`))
           .children(found.mine.map((change, i) => changeRow(change, `${ci}-m${i}`, host)))
           .child(small(`TO REVIEW · ${found.review.length}`))
-          .children(found.review.map((change, i) => changeRow(change, `${ci}-r${i}`, host))));
+          .children(found.review.map((change, i) => changeRow(change, `${ci}-r${i}`, host)))
+          .when(Boolean(c.code?.unassigned), (el) => el
+            .child(small(`NO REVIEWER · ${found.unassigned.length}`))
+            .children(found.unassigned.map((change, i) => changeRow(change, `${ci}-u${i}`, host)))));
     };
     // A client: its name, how many tickets are open, its boards; folded, only that
     const section = (c, ci) => {
@@ -676,7 +679,7 @@ export default class Workbench extends View {
         .child(div().text_size(11.5).text_color(t.dim).child(tk.assignee?.name ?? "Unassigned"));
     // The merge request of the focused space's branch, from the lists already loaded
     const branch = space?.branch;
-    const hc = branch ? Object.values(this.side.changes).flatMap((f) => [...f.mine, ...f.review]).find((c) => c.branch === branch) : null;
+    const hc = branch ? Object.values(this.side.changes).flatMap((f) => [...f.mine, ...f.review, ...f.unassigned]).find((c) => c.branch === branch) : null;
     const hereChange = hc && v_flex().id("here-change").flex_none().p(10).gap(4).rounded(8).border_1().border_color(t.border).bg(t.background)
       .cursor_pointer().hover((s) => s.border_color(t.input)).tooltip("Open the merge request").on_click(() => this.browse(hc))
       .child(h_flex().items_center().gap(6)
@@ -865,7 +868,7 @@ export default class Workbench extends View {
   renderSessions(cx) {
     const t = theme();
     const list = sessions(this.tags);
-    const changes = Object.values(this.sessionChanges).flatMap((f) => [...f.mine, ...f.review]);
+    const changes = Object.values(this.sessionChanges).flatMap((f) => [...f.mine, ...f.review, ...f.unassigned]);
     const changesOf = (s) => (s.branch ? changes.filter((c) => c.branch === s.branch) : []);
     const work = list.filter((s) => s.key || changesOf(s).length)
       .sort((a, b) => urgency(a.status) - urgency(b.status) || b.changed - a.changed);
@@ -1123,7 +1126,7 @@ export default class Workbench extends View {
     const columns = entry?.columns ?? [];
     const sel = this.selected && ((entry?.tickets ?? []).find((x) => x.key === this.selected.key) ?? this.selected);
     const selChange = this.selectedChange
-      && ([...(this.changes.mine ?? []), ...(this.changes.review ?? [])].find((x) => x.id === this.selectedChange.id) ?? this.selectedChange);
+      && ([...(this.changes.mine ?? []), ...(this.changes.review ?? []), ...(this.changes.unassigned ?? [])].find((x) => x.id === this.selectedChange.id) ?? this.selectedChange);
     // Lanes come from every ticket, so "Only mine" never turns a story into a card; empty lanes go, the plain board stays
     const shown = (entry?.lanes ?? [])
       .map((l) => ({ ...l, tickets: l.tickets.filter(isMine) }))
@@ -1142,19 +1145,19 @@ export default class Workbench extends View {
         .child(div().size(12).rounded_full().bg(t.background)))
       .child(div().text_size(12).text_color(this.mine ? t.foreground : t.muted).child("Only mine"));
     const status = onChanges
-      ? (changes.at ? `${(changes.mine?.length ?? 0) + (changes.review?.length ?? 0)} open · updated ${changes.at.toTimeString().slice(0, 5)}` : "Loading…")
+      ? (changes.at ? `${(changes.mine?.length ?? 0) + (changes.review?.length ?? 0) + (changes.unassigned?.length ?? 0)} open · updated ${changes.at.toTimeString().slice(0, 5)}` : "Loading…")
       : entry?.at
       ? `${tickets.length} ${this.mine ? "yours" : "tickets"}` + (entry.total > (entry.tickets?.length ?? 0) ? ` (first ${entry.tickets.length} of ${entry.total})` : "")
         + ` · updated ${entry.at.toTimeString().slice(0, 5)}`
       : loading || (!this.client && !this.problem) ? "Loading…" : "";
     // The merge requests tab: yours, then the ones waiting for your review
-    const group = (title, list, yours) => v_flex().flex_none().gap(8)
+    const group = (title, list, yours, key = yours ? "mine" : "review") => v_flex().flex_none().gap(8)
       .child(h_flex().items_center().gap(8).px(2)
         .child(div().text_size(13).font_semibold().child(title))
         .when(Array.isArray(list), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(`(${list.length})`))))
       .when(Array.isArray(list) && !list.length, (el) => el.child(div().px(2).text_size(12).text_color(t.dim).child("None")))
       .child(h_flex().flex_wrap().items_start().gap(10)
-        .children((list ?? []).map((c, i) => this.changeCard(t, c, `${yours ? "mine" : "review"}-${i}`, yours))));
+        .children((list ?? []).map((c, i) => this.changeCard(t, c, `${key}-${i}`, yours))));
     return v_flex().id("workbench").size_full().min_h(0).p(16).gap(12).bg(t.popover).text_color(t.foreground)
       .child(h_flex().items_center().gap(8)
         .child(div().flex_none().pr(6).text_size(15).font_semibold().child(this.client?.name ?? "Workbench"))
@@ -1180,7 +1183,8 @@ export default class Workbench extends View {
         .children(entry?.columns ? shown.map((l) => this.lane(t, board, columns, l)) : [])))
       .when(onChanges, (el) => el.child(v_flex().id("changes").flex_1().min_h(0).gap(20).overflow_y_scrollbar()
         .child(group("Yours", changes.mine, true))
-        .child(group("To review", changes.review, false))))
+        .child(group("To review", changes.review, false))
+        .when(Boolean(this.client?.code?.unassigned), (el) => el.child(group("No reviewer", changes.unassigned, false, "free")))))
       .when(!onChanges && Boolean(sel), (el) => el.child(this.panel(t, sel, button)))
       .when(onChanges && Boolean(selChange), (el) => el.child(this.changePanel(t, selChange, button)))
       .child(h_flex().gap(8).text_size(11).text_color(t.dim)
