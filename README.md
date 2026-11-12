@@ -85,3 +85,7 @@ The token never goes in the profile. Copy it, then store it in the Keychain unde
 ```sh
 security add-generic-password -U -s workbench -a acme-jira -w "$(pbpaste)"
 ```
+
+## License
+
+GPL-3.0-or-later, see `LICENSE`.
